@@ -1,17 +1,18 @@
 import logging
 import os
 import zipfile
+import gdown
 import torch
 import numpy as np
 import chromadb
-import gdown
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List
 from sentence_transformers import SentenceTransformer, util
 
 # --- 1. Configuration & Constants ---
-CHROMA_PATH = "/app/product_db"
+DB_PATH = "/app/product_db"
+CHECK_FILE = os.path.join(DB_PATH, "chromadb.sqlite3")
 COLLECTION_NAME = "products"
 MODEL_NAME = 'distiluse-base-multilingual-cased-v1'
 API_VERSION = "0.1.0"
@@ -22,44 +23,34 @@ GDRIVE_FOLDER_ID = "1-tktqeXhjjvpACRWHd9xE2UgDzpt4aco"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- 3. Automated Database Setup ---
+# --- 3. Database Initialization (Download if needed) ---
 def setup_database():
-    """
-    Checks for the database. If not present, downloads and extracts it from Google Drive.
-    """
-    check_file = os.path.join(CHROMA_PATH, "chroma.sqlite3")
-    
-    if os.path.exists(check_file):
-        logger.info("✅ Database found. Skipping download.")
+    """Checks for the database and downloads it from Google Drive if not found."""
+    logger.info("--- Running Database Setup Check ---")
+    if os.path.exists(CHECK_FILE):
+        logger.info(f"✅ Database file found at {CHECK_FILE}. Skipping download.")
         return
 
-    logger.warning("🟡 Database not found. Initializing download from Google Drive...")
-    
-    zip_path = os.path.join(CHROMA_PATH, "product_db.zip")
-    
+    logger.warning(f"🟡 Database not found. Initializing download from Google Drive...")
     try:
-        # Create the target directory if it doesn't exist
-        os.makedirs(CHROMA_PATH, exist_ok=True)
-        
-        # Download the folder from Google Drive
-        logger.info(f"Downloading folder with ID: {GDRIVE_FOLDER_ID} to {zip_path}")
-        gdown.download_folder(id=GDRIVE_FOLDER_ID, output=zip_path, quiet=False)
-        
-        # Unzip the file
-        logger.info(f"Extracting {zip_path}...")
+        os.makedirs(DB_PATH, exist_ok=True)
+        zip_path = os.path.join(DB_PATH, "product_db.zip")
+
+        logger.info(f"Downloading folder with ID: {GDRIVE_FOLDER_ID}")
+        gdown.download_folder(id=GDRIVE_FOLDER_ID, output=zip_path, quiet=False, use_cookies=False)
+
+        logger.info("Download complete. Extracting archive...")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(CHROMA_PATH)
-        
-        # Clean up the zip file
+            zip_ref.extractall(DB_PATH)
         os.remove(zip_path)
         logger.info("✅ Database setup complete.")
-        
+
     except Exception as e:
         logger.critical(f"❌ Critical error during database setup: {e}", exc_info=True)
-        # Stop the application if DB setup fails
-        raise RuntimeError("Could not set up the database.") from e
+        # Exit if DB setup fails, to prevent the app from starting in a bad state
+        raise RuntimeError("Failed to setup database.") from e
 
-# Run the database setup before anything else
+# Run the setup function before anything else
 setup_database()
 
 
@@ -71,8 +62,8 @@ try:
     model = SentenceTransformer(MODEL_NAME, device=device)
     logger.info("✅ Embedding model loaded successfully.")
 
-    logger.info(f"Connecting to ChromaDB at path: {CHROMA_PATH}")
-    db_client = chromadb.PersistentClient(path=CHROMA_PATH)
+    logger.info(f"Connecting to ChromaDB at path: {DB_PATH}")
+    db_client = chromadb.PersistentClient(path=DB_PATH)
     collection = db_client.get_collection(name=COLLECTION_NAME)
     logger.info(f"✅ Successfully connected to ChromaDB. Collection '{COLLECTION_NAME}' contains {collection.count()} items.")
 
@@ -80,7 +71,6 @@ except Exception as e:
     logger.critical(f"❌ Critical error during component initialization: {e}", exc_info=True)
     collection = None
     model = None
-
 
 # --- 5. Pydantic Models for API I/O ---
 class HybridSearchRequest(BaseModel):
@@ -102,7 +92,6 @@ app = FastAPI(
 
 @app.post("/hybrid-search/", response_model=List[SearchResult])
 def hybrid_search(request: HybridSearchRequest):
-    # The rest of the API code remains the same...
     logger.info(f"Received search request. Query: '{request.query}', Keywords: {request.keywords}")
 
     if collection is None or model is None:
@@ -112,7 +101,7 @@ def hybrid_search(request: HybridSearchRequest):
     if not request.keywords:
         logger.warning("Request received with empty keywords list.")
         raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
-        
+
     try:
         where_filter = {}
         if len(request.keywords) == 1:
@@ -133,7 +122,7 @@ def hybrid_search(request: HybridSearchRequest):
         return []
 
     logger.info(f"Found {len(results_keyword['ids'])} results after keyword filtering. Proceeding to re-ranking.")
-    
+
     full_query_embedding = model.encode(request.query)
     filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
     similarities = util.cos_sim(full_query_embedding, filtered_embeddings)
@@ -154,5 +143,9 @@ def hybrid_search(request: HybridSearchRequest):
 
 @app.get("/", summary="Health Check")
 def read_root():
-    return { "status": "OK", "message": "Hybrid search server is running.", "version": API_VERSION }
+    return {
+        "status": "OK",
+        "message": "Hybrid search server is running.",
+        "version": API_VERSION
+    }
 

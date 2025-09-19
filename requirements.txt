@@ -5,3 +5,4 @@ pydantic
 fastapi
 uvicorn[standard]
 sentence-transformers
+gdown

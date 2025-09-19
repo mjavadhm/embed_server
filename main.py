@@ -17,7 +17,7 @@ COLLECTION_NAME = "products"
 MODEL_NAME = 'distiluse-base-multilingual-cased-v1'
 API_VERSION = "0.1.0"
 TOP_K_RESULTS = 15
-GDRIVE_FOLDER_ID = "1-tktqeXhjjvpACRWHd9xE2UgDzpt4aco"
+GDRIVE_FOLDER_ID = "1i6Ff59kQ9yc_kCP7-TvakdDHZcRyxqJe"
 
 # --- 2. Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,9 +27,9 @@ logger = logging.getLogger(__name__)
 def setup_database():
     """Checks for the database and downloads it from Google Drive if not found."""
     logger.info("--- Running Database Setup Check ---")
-    if os.path.exists(CHECK_FILE):
-        logger.info(f"✅ Database file found at {CHECK_FILE}. Skipping download.")
-        return
+    # if os.path.exists(CHECK_FILE):
+    #     logger.info(f"✅ Database file found at {CHECK_FILE}. Skipping download.")
+    #     return
 
     logger.warning(f"🟡 Database not found. Initializing download from Google Drive...")
     try:

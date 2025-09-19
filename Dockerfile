@@ -1,49 +1,23 @@
-# Stage 1: Build Stage
-# Use a specific Python version for reproducibility
-FROM python:3.10-slim AS builder
-
-WORKDIR /app
-
-# Install system dependencies that might be needed for some Python packages
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential
-
-# Copy dependency definition files
-COPY requirements.txt .
-
-# Install dependencies into a virtual environment
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-# gdown is now in requirements.txt and will be installed here
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Stage 2: Final Stage
-# Use the same base image
+# Use a slim Python base image
 FROM python:3.10-slim
 
-# Install runtime system dependencies (unzip for the startup script)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    unzip \
-    && rm -rf /var/lib/apt/lists/*
-
+# Set working directory
 WORKDIR /app
 
-# Copy the virtual environment from the builder stage
-COPY --from=builder /opt/venv /opt/venv
+# Copy dependency definition file
+COPY requirements.txt .
 
-# Activate the virtual environment
-ENV PATH="/opt/venv/bin:$PATH"
+# Install dependencies. The venv is not strictly necessary in a container
+# but we install gdown which requires pip.
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the application source code and the new startup script
+# Copy the application source code
 COPY main.py .
-COPY startup.sh .
-
-# Make the startup script executable
-RUN chmod +x ./startup.sh
 
 # Expose the port the app will run on
 EXPOSE 8000
 
-# Use the startup script as the command to run the container.
-# This script will handle DB download and then start the Uvicorn server.
-CMD ["./startup.sh"]
+# Command to run the application using Uvicorn
+# This is the standard way and is less likely to be overridden by platforms.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 

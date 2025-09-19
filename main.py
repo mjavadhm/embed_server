@@ -1,63 +1,99 @@
 import logging
+import os
+import zipfile
 import torch
 import numpy as np
 import chromadb
+import gdown
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List
 from sentence_transformers import SentenceTransformer, util
 
 # --- 1. Configuration & Constants ---
-# This path points to the volume mount location inside the Docker container.
 CHROMA_PATH = "/app/product_db"
 COLLECTION_NAME = "products"
 MODEL_NAME = 'distiluse-base-multilingual-cased-v1'
 API_VERSION = "0.1.0"
 TOP_K_RESULTS = 15
+GDRIVE_FOLDER_ID = "1-tktqeXhjjvpACRWHd9xE2UgDzpt4aco"
 
 # --- 2. Logging Setup ---
-# Configure logger to output to the console
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- 3. Model & Database Loading ---
-# This block runs once when the application starts.
+# --- 3. Automated Database Setup ---
+def setup_database():
+    """
+    Checks for the database. If not present, downloads and extracts it from Google Drive.
+    """
+    check_file = os.path.join(CHROMA_PATH, "chroma.sqlite3")
+    
+    if os.path.exists(check_file):
+        logger.info("✅ Database found. Skipping download.")
+        return
+
+    logger.warning("🟡 Database not found. Initializing download from Google Drive...")
+    
+    zip_path = os.path.join(CHROMA_PATH, "product_db.zip")
+    
+    try:
+        # Create the target directory if it doesn't exist
+        os.makedirs(CHROMA_PATH, exist_ok=True)
+        
+        # Download the folder from Google Drive
+        logger.info(f"Downloading folder with ID: {GDRIVE_FOLDER_ID} to {zip_path}")
+        gdown.download_folder(id=GDRIVE_FOLDER_ID, output=zip_path, quiet=False)
+        
+        # Unzip the file
+        logger.info(f"Extracting {zip_path}...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(CHROMA_PATH)
+        
+        # Clean up the zip file
+        os.remove(zip_path)
+        logger.info("✅ Database setup complete.")
+        
+    except Exception as e:
+        logger.critical(f"❌ Critical error during database setup: {e}", exc_info=True)
+        # Stop the application if DB setup fails
+        raise RuntimeError("Could not set up the database.") from e
+
+# Run the database setup before anything else
+setup_database()
+
+
+# --- 4. Model & Database Loading ---
 try:
     logger.info("Initializing application components...")
-
-    # Determine the appropriate device for torch (CUDA if available, otherwise CPU)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Loading sentence transformer model: {MODEL_NAME} onto device: '{device}'")
     model = SentenceTransformer(MODEL_NAME, device=device)
     logger.info("✅ Embedding model loaded successfully.")
 
-    # Establish a persistent connection to the ChromaDB client
     logger.info(f"Connecting to ChromaDB at path: {CHROMA_PATH}")
     db_client = chromadb.PersistentClient(path=CHROMA_PATH)
     collection = db_client.get_collection(name=COLLECTION_NAME)
     logger.info(f"✅ Successfully connected to ChromaDB. Collection '{COLLECTION_NAME}' contains {collection.count()} items.")
 
 except Exception as e:
-    logger.critical(f"❌ Critical error during initialization: {e}", exc_info=True)
-    # Set collection to None to indicate failure, which will be handled in the API endpoint
+    logger.critical(f"❌ Critical error during component initialization: {e}", exc_info=True)
     collection = None
     model = None
 
-# --- 4. Pydantic Models for API I/O ---
+
+# --- 5. Pydantic Models for API I/O ---
 class HybridSearchRequest(BaseModel):
-    """Defines the expected input for the hybrid search endpoint."""
     query: str = Field(..., description="The full-text query for semantic search.", example="velvet kitchen rug")
     keywords: List[str] = Field(..., description="A list of keywords for initial filtering.", example=["rug", "velvet"])
 
 class SearchResult(BaseModel):
-    """Defines the structure of a single search result item."""
     id: str = Field(..., description="Unique identifier of the product.")
     name: str = Field(..., description="The Persian name of the product.")
     score: float = Field(..., description="The semantic similarity score as a percentage (0-100).")
 
 
-# --- 5. FastAPI Application ---
+# --- 6. FastAPI Application ---
 app = FastAPI(
     title="Hybrid Product Search API",
     description="An API that performs a two-stage hybrid search: keyword-based filtering followed by semantic re-ranking.",
@@ -66,10 +102,7 @@ app = FastAPI(
 
 @app.post("/hybrid-search/", response_model=List[SearchResult])
 def hybrid_search(request: HybridSearchRequest):
-    """
-    Performs a hybrid search by first filtering with keywords and then
-    re-ranking the results based on semantic similarity to the full query.
-    """
+    # The rest of the API code remains the same...
     logger.info(f"Received search request. Query: '{request.query}', Keywords: {request.keywords}")
 
     if collection is None or model is None:
@@ -79,16 +112,12 @@ def hybrid_search(request: HybridSearchRequest):
     if not request.keywords:
         logger.warning("Request received with empty keywords list.")
         raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
-
-    # --- Step 1: Keyword-based Filtering (Corrected Logic) ---
+        
     try:
         where_filter = {}
-        # Handle single vs. multiple keywords for ChromaDB filter
         if len(request.keywords) == 1:
-            # If there's only one keyword, use a simple $contains filter
             where_filter = {"$contains": request.keywords[0]}
         else:
-            # If there are multiple keywords, use the $or filter
             where_filter = {"$or": [{"$contains": kw} for kw in request.keywords]}
         
         results_keyword = collection.get(
@@ -104,8 +133,7 @@ def hybrid_search(request: HybridSearchRequest):
         return []
 
     logger.info(f"Found {len(results_keyword['ids'])} results after keyword filtering. Proceeding to re-ranking.")
-
-    # --- Step 2: Semantic Re-ranking ---
+    
     full_query_embedding = model.encode(request.query)
     filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
     similarities = util.cos_sim(full_query_embedding, filtered_embeddings)
@@ -119,7 +147,6 @@ def hybrid_search(request: HybridSearchRequest):
         })
     
     reranked_results.sort(key=lambda x: x['score'], reverse=True)
-
     final_results = reranked_results[:TOP_K_RESULTS]
     logger.info(f"Returning {len(final_results)} re-ranked results.")
     
@@ -127,12 +154,5 @@ def hybrid_search(request: HybridSearchRequest):
 
 @app.get("/", summary="Health Check")
 def read_root():
-    """
-    Provides a simple health check endpoint to confirm the server is running.
-    """
-    return {
-        "status": "OK",
-        "message": "Hybrid search server is running.",
-        "version": API_VERSION
-    }
+    return { "status": "OK", "message": "Hybrid search server is running.", "version": API_VERSION }
 

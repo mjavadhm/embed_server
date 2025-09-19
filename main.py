@@ -1,7 +1,5 @@
 import logging
 import os
-import zipfile
-import gdown
 import torch
 import numpy as np
 import chromadb
@@ -11,58 +9,32 @@ from typing import List
 from sentence_transformers import SentenceTransformer, util
 
 # --- 1. Configuration & Constants ---
+# --- Paths are now local within the container ---
 DB_PATH = "/app/product_db"
-CHECK_FILE = os.path.join(DB_PATH, "chromadb.sqlite3")
+MODEL_PATH = "/app/embedding_model" # Path to the local model
 COLLECTION_NAME = "products"
-MODEL_NAME = 'distiluse-base-multilingual-cased-v1'
 API_VERSION = "0.1.0"
 TOP_K_RESULTS = 15
-GDRIVE_FOLDER_ID = "1i6Ff59kQ9yc_kCP7-TvakdDHZcRyxqJe"
 
 # --- 2. Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- 3. Database Initialization (Download if needed) ---
-def setup_database():
-    """Checks for the database and downloads it from Google Drive if not found."""
-    logger.info("--- Running Database Setup Check ---")
-    # if os.path.exists(CHECK_FILE):
-    #     logger.info(f"✅ Database file found at {CHECK_FILE}. Skipping download.")
-    #     return
-
-    logger.warning(f"🟡 Database not found. Initializing download from Google Drive...")
-    try:
-        os.makedirs(DB_PATH, exist_ok=True)
-        zip_path = os.path.join(DB_PATH, "product_db.zip")
-
-        logger.info(f"Downloading folder with ID: {GDRIVE_FOLDER_ID}")
-        gdown.download_folder(id=GDRIVE_FOLDER_ID, output=zip_path, quiet=False, use_cookies=False)
-
-        logger.info("Download complete. Extracting archive...")
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(DB_PATH)
-        os.remove(zip_path)
-        logger.info("✅ Database setup complete.")
-
-    except Exception as e:
-        logger.critical(f"❌ Critical error during database setup: {e}", exc_info=True)
-        # Exit if DB setup fails, to prevent the app from starting in a bad state
-        raise RuntimeError("Failed to setup database.") from e
-
-# Run the setup function before anything else
-setup_database()
-
-
-# --- 4. Model & Database Loading ---
+# --- 3. Model & Database Loading ---
+# --- All download logic is REMOVED ---
 try:
-    logger.info("Initializing application components...")
+    logger.info("--- Initializing application components from local paths ---")
+
+    # Determine device (CPU is expected in the Docker container)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Loading sentence transformer model: {MODEL_NAME} onto device: '{device}'")
-    model = SentenceTransformer(MODEL_NAME, device=device)
+    logger.info(f"Loading sentence transformer model from local path: {MODEL_PATH} onto device: '{device}'")
+    
+    # Load the model from the local directory inside the container
+    model = SentenceTransformer(MODEL_PATH, device=device)
     logger.info("✅ Embedding model loaded successfully.")
 
-    logger.info(f"Connecting to ChromaDB at path: {DB_PATH}")
+    logger.info(f"Connecting to ChromaDB at local path: {DB_PATH}")
+    # Connect to the persistent database inside the container
     db_client = chromadb.PersistentClient(path=DB_PATH)
     collection = db_client.get_collection(name=COLLECTION_NAME)
     logger.info(f"✅ Successfully connected to ChromaDB. Collection '{COLLECTION_NAME}' contains {collection.count()} items.")
@@ -72,7 +44,7 @@ except Exception as e:
     collection = None
     model = None
 
-# --- 5. Pydantic Models for API I/O ---
+# --- 4. Pydantic Models for API I/O ---
 class HybridSearchRequest(BaseModel):
     query: str = Field(..., description="The full-text query for semantic search.", example="velvet kitchen rug")
     keywords: List[str] = Field(..., description="A list of keywords for initial filtering.", example=["rug", "velvet"])
@@ -82,11 +54,10 @@ class SearchResult(BaseModel):
     name: str = Field(..., description="The Persian name of the product.")
     score: float = Field(..., description="The semantic similarity score as a percentage (0-100).")
 
-
-# --- 6. FastAPI Application ---
+# --- 5. FastAPI Application ---
 app = FastAPI(
-    title="Hybrid Product Search API",
-    description="An API that performs a two-stage hybrid search: keyword-based filtering followed by semantic re-ranking.",
+    title="Hybrid Product Search API (Self-Contained)",
+    description="An API that performs a two-stage hybrid search from a self-contained Docker appliance.",
     version=API_VERSION
 )
 
@@ -148,4 +119,3 @@ def read_root():
         "message": "Hybrid search server is running.",
         "version": API_VERSION
     }
-

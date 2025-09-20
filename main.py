@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 collection = None
 app_initialized = False
 KEYWORD_BATCH_SIZE = 100
+ID_RERANK_BATCH_SIZE = 500
 
 # --- 4. مدل‌های Pydantic ---
 class VectorSearchRequest(BaseModel):
@@ -91,64 +92,67 @@ def search_sync_pure_vector(embedding: List[float]) -> List[SearchResult]:
 
 def search_sync_hybrid(embedding: List[float], keywords: List[str]) -> List[SearchResult]:
     """
-    جستجوی ترکیبی با تقسیم کلیدواژه‌ها به دسته‌های کوچک‌تر برای جلوگیری از خطای دیتابیس.
+    جستجوی ترکیبی کاملاً دسته‌بندی شده برای جلوگیری از خطای "too many SQL variables"
+    بدون از دست دادن هیچ نتیجه‌ای.
     """
-    logger.info(f"Performing HYBRID search with {len(keywords)} keywords.")
+    logger.info(f"Performing FULLY BATCHED HYBRID search with {len(keywords)} keywords.")
     
-    # اگر تعداد کلیدواژه‌ها کم است، از روش قبلی استفاده کن
-    if len(keywords) <= KEYWORD_BATCH_SIZE:
-        where_filter = {"$or": [{"$contains": kw} for kw in keywords]} if len(keywords) > 1 else {"$contains": keywords[0]}
-        results_keyword = collection.get(where_document=where_filter, include=["documents"])
-    else:
-        # اگر تعداد کلیدواژه‌ها زیاد است، آن‌ها را دسته‌بندی کن
-        logger.info(f"Keyword count exceeds batch size. Splitting into chunks of {KEYWORD_BATCH_SIZE}.")
-        all_ids = set()
-        
-        # تقسیم لیست کلیدواژه‌ها به دسته‌های کوچک‌تر
-        keyword_batches = [keywords[i:i + KEYWORD_BATCH_SIZE] for i in range(0, len(keywords), KEYWORD_BATCH_SIZE)]
-        
-        for batch in keyword_batches:
-            logger.info(f"Processing keyword batch with {len(batch)} items.")
-            where_filter = {"$or": [{"$contains": kw} for kw in batch]}
-            try:
-                batch_results = collection.get(where_document=where_filter, include=[]) # فقط آی‌دی‌ها را لازم داریم
-                if batch_results and batch_results.get('ids'):
-                    all_ids.update(batch_results['ids'])
-            except Exception as e:
-                logger.warning(f"A batch query failed, but continuing. Error: {e}")
+    # --- مرحله ۱: فیلتر کردن با کلیدواژه‌ها به صورت دسته‌بندی شده ---
+    all_ids_from_keyword_filter = set()
+    keyword_batches = [keywords[i:i + KEYWORD_BATCH_SIZE] for i in range(0, len(keywords), KEYWORD_BATCH_SIZE)]
+    
+    for batch in keyword_batches:
+        where_filter = {"$or": [{"$contains": kw} for kw in batch]} if len(batch) > 1 else {"$contains": batch[0]}
+        try:
+            # فقط آی‌دی‌ها را می‌گیریم تا حجم داده کمتر باشد
+            batch_results = collection.get(where_document=where_filter, include=[])
+            if batch_results and batch_results.get('ids'):
+                all_ids_from_keyword_filter.update(batch_results['ids'])
+        except Exception as e:
+            logger.warning(f"A keyword batch query failed, but continuing. Error: {e}")
 
-        if not all_ids:
-            logger.warning("No results found after keyword filtering stage.")
-            return []
-            
-        # ساخت یک دیکشنری نتیجه ساختگی برای سازگاری با بقیه کد
-        results_keyword = {'ids': list(all_ids)}
-
-    if not results_keyword or not results_keyword.get('ids'):
+    if not all_ids_from_keyword_filter:
         logger.warning("No results found after keyword filtering stage.")
         return []
-        
-    logger.info(f"Found {len(results_keyword['ids'])} unique results after keyword filter. Reranking...")
     
-    # مرحله نهایی: جستجوی وکتوری روی آی‌دی‌های پیدا شده
-    # نکته: اگر تعداد آی‌دی‌ها خیلی زیاد باشد (مثلا چند ده هزار)، این بخش هم ممکن است کند شود
-    # اما معمولا بسیار سریع‌تر از جستجوی متنی است.
-    vector_search_results = collection.query(
-        query_embeddings=[embedding],
-        n_results=TOP_K_RESULTS,
-        where={"id": {"$in": results_keyword['ids']}}
-    )
+    unique_ids = list(all_ids_from_keyword_filter)
+    logger.info(f"Found {len(unique_ids)} unique results after keyword filter. Reranking in batches...")
 
-    if not vector_search_results or not vector_search_results.get('ids')[0]:
+    # --- مرحله ۲: رتبه‌بندی مجدد (جستجوی وکتوری) به صورت دسته‌بندی شده ---
+    all_final_results = []
+    id_batches = [unique_ids[i:i + ID_RERANK_BATCH_SIZE] for i in range(0, len(unique_ids), ID_RERANK_BATCH_SIZE)]
+
+    for id_batch in id_batches:
+        try:
+            vector_search_results = collection.query(
+                query_embeddings=[embedding],
+                n_results=len(id_batch), # تمام نتایج این دسته را می‌خواهیم
+                where={"id": {"$in": id_batch}}
+            )
+
+            if vector_search_results and vector_search_results.get('ids')[0]:
+                ids = vector_search_results['ids'][0]
+                distances = vector_search_results['distances'][0]
+                documents = vector_search_results['documents'][0]
+                for i in range(len(ids)):
+                    score = (1 - distances[i]) * 100
+                    all_final_results.append({"id": ids[i], "name": documents[i], "score": score})
+        except Exception as e:
+            logger.warning(f"An ID batch query for reranking failed, but continuing. Error: {e}")
+            
+    # --- مرحله ۳: مرتب‌سازی نهایی و انتخاب بهترین نتایج ---
+    if not all_final_results:
         logger.warning("No results found after reranking stage.")
         return []
 
-    final_results = []
-    ids, distances, documents = vector_search_results['ids'][0], vector_search_results['distances'][0], vector_search_results['documents'][0]
-    for i in range(len(ids)):
-        score = (1 - distances[i]) * 100
-        final_results.append({"id": ids[i], "name": documents[i], "score": score})
-    return final_results
+    # مرتب‌سازی تمام نتایج جمع‌آوری شده بر اساس امتیاز (score) به صورت نزولی
+    all_final_results.sort(key=lambda x: x['score'], reverse=True)
+    
+    # برگرداندن N نتیجه برتر (TOP_K_RESULTS)
+    top_results = all_final_results[:TOP_K_RESULTS]
+    
+    logger.info(f"Returning {len(top_results)} final hybrid search results after sorting all candidates.")
+    return top_results
 
 def get_embedding_by_name_sync(product_name: str) -> Optional[List[float]]:
     """

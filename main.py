@@ -9,7 +9,7 @@ from typing import List
 # --- 1. پیکربندی و ثابت‌ها ---
 DB_PATH = "/app/product_db"
 COLLECTION_NAME = "products"
-API_VERSION = "2.4.0-headless-stable-scoring"
+API_VERSION = "2.5.0-headless-input-validation"
 TOP_K_RESULTS = 15
 KEYWORD_BATCH_SIZE = 100
 MAX_FILTER_RESULTS = 20000 
@@ -40,8 +40,8 @@ class SearchResult(BaseModel):
 
 # --- 5. اپلیکیشن FastAPI ---
 app = FastAPI(
-    title="Stable Scoring Headless Hybrid Search API",
-    description="یک API کامل، سبک و مقاوم با سیستم امتیازدهی اصلاح شده برای جستجوی ترکیبی.",
+    title="Final Validated Headless Hybrid Search API",
+    description="نسخه نهایی API جستجوی ترکیبی با اعتبارسنجی وکتور ورودی.",
     version=API_VERSION
 )
 
@@ -54,6 +54,17 @@ async def hybrid_search(request: VectorSearchRequest):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Keywords list cannot be empty.")
 
     try:
+        query_embedding = np.array(request.embedding, dtype=np.float32)
+
+        # --- ✨✨✨ اعتبارسنجی اصلی اینجاست ✨✨✨ ---
+        # چک می‌کنیم که آیا وکتور ورودی یک وکتور صفر است یا نه
+        if np.all(query_embedding == 0):
+            logger.error("وکتور امبدینگ ورودی یک وکتور صفر است و نمی‌تواند برای جستجو استفاده شود.")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The provided embedding is a zero vector. Cannot perform similarity search."
+            )
+
         # مرحله ۱: فیلتر کردن با کلیدواژه‌ها
         all_ids_from_keyword_filter = set()
         normalized_keywords = [kw.lower() for kw in request.keywords]
@@ -71,39 +82,25 @@ async def hybrid_search(request: VectorSearchRequest):
             return []
         
         if len(all_ids_from_keyword_filter) > MAX_FILTER_RESULTS:
-            logger.warning(f"فیلتر اولیه {len(all_ids_from_keyword_filter)} نتیجه برگرداند که از آستانه {MAX_FILTER_RESULTS} بیشتر است.")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="The provided keywords are too general. Please use more specific keywords to narrow down the search."
             )
         
         unique_ids = list(all_ids_from_keyword_filter)
-        logger.info(f"{len(unique_ids)} نتیجه پس از فیلتر یافت شد. در حال واکشی اطلاعات...")
-
+        
         # مرحله ۲: گرفتن اطلاعات کامل محصولات
         results_keyword = collection.get(ids=unique_ids, include=["documents", "embeddings"])
         if not results_keyword or not results_keyword.get('ids'):
             return []
         
-        logger.info(f"اطلاعات کامل برای {len(results_keyword['ids'])} محصول دریافت شد. در حال رتبه‌بندی مجدد...")
-
-        # --- ✨✨✨ تغییر اصلی: محاسبه امن شباهت کسینوسی ✨✨✨ ---
-        
-        # مرحله ۳: محاسبه شباهت با NumPy به روشی امن و استاندارد
-        query_embedding = np.array(request.embedding, dtype=np.float32)
+        # مرحله ۳: محاسبه امن شباهت کسینوسی
         filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
-
-        # محاسبه ضرب داخلی
         dot_product = np.dot(filtered_embeddings, query_embedding)
-
-        # محاسبه نرم (طول) وکتورها
         query_norm = np.linalg.norm(query_embedding)
         filtered_norms = np.linalg.norm(filtered_embeddings, axis=1)
-
-        # محاسبه مخرج کسر برای شباهت کسینوسی
         denominator = query_norm * filtered_norms
         
-        # تقسیم امن: فقط در جایی که مخرج صفر نیست تقسیم انجام شود، در غیر این صورت حاصل صفر خواهد بود
         similarities = np.divide(dot_product, denominator, out=np.zeros_like(dot_product, dtype=float), where=denominator!=0)
 
         reranked_results = []

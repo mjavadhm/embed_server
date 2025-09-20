@@ -1,133 +1,246 @@
 import logging
 import os
 import chromadb
-import numpy as np
-from fastapi import FastAPI, HTTPException, status
+import asyncio
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
+from pathlib import Path
+import gdown
 
 # --- 1. پیکربندی و ثابت‌ها ---
-DB_PATH = "/app/product_db"
+BASE_DATA_DIR = Path("/app/product_db")
+DB_PATH = str(BASE_DATA_DIR)
 COLLECTION_NAME = "products"
-API_VERSION = "2.5.0-headless-input-validation"
+API_VERSION = "2.3.0-final-debug"
 TOP_K_RESULTS = 15
-KEYWORD_BATCH_SIZE = 100
-MAX_FILTER_RESULTS = 20000 
 
 # --- 2. راه‌اندازی لاگ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- 3. بارگذاری دیتابیس ---
-try:
-    logger.info(f"--- در حال اتصال به ChromaDB در مسیر محلی: {DB_PATH} ---")
-    db_client = chromadb.PersistentClient(path=DB_PATH)
-    collection = db_client.get_collection(name=COLLECTION_NAME)
-    logger.info(f"✅ اتصال به ChromaDB موفقیت‌آمیز بود. کالکشن '{COLLECTION_NAME}' شامل {collection.count()} آیتم است.")
-except Exception as e:
-    logger.critical(f"❌ خطای بحرانی هنگام اتصال به دیتابیس: {e}", exc_info=True)
-    collection = None
+# --- 3. متغیرهای سراسری ---
+collection = None
+app_initialized = False
 
-# --- 4. مدل‌های Pydantic برای API ---
+# --- 4. مدل‌های Pydantic ---
 class VectorSearchRequest(BaseModel):
-    embedding: List[float] = Field(..., description="وکتور امبدینگ از پیش محاسبه شده برای کوئری.")
-    keywords: List[str] = Field(..., description="لیستی از کلمات کلیدی برای فیلتر اولیه.", example=["فرش", "مخمل"])
+    embedding: List[float] = Field(..., description="The pre-computed embedding vector for the query.")
+    keywords: List[str] = Field(..., description="A list of keywords for initial filtering.", example=["rug", "velvet"])
 
 class SearchResult(BaseModel):
-    id: str = Field(..., description="شناسه منحصر به فرد محصول.")
-    name: str = Field(..., description="نام فارسی محصول.")
-    score: float = Field(..., description="امتیاز شباهت معنایی به صورت درصد (0-100).")
+    id: str
+    name: str
+    score: float
 
-# --- 5. اپلیکیشن FastAPI ---
+class DownloadRequest(BaseModel):
+    drive_link: str
+    destination_path: str = ""
+
+class DebugRequest(BaseModel):
+    product_name: str = Field(..., description="نام دقیق فارسی محصول برای جستجو.")
+
+class DebugResponse(BaseModel):
+    product_name: str
+    embedding: List[float]
+
+
+# --- 5. ساخت اپلیکیشن FastAPI ---
 app = FastAPI(
-    title="Final Validated Headless Hybrid Search API",
-    description="نسخه نهایی API جستجوی ترکیبی با اعتبارسنجی وکتور ورودی.",
+    title="Headless Vector Search API (Debug & Production Ready)",
+    description="Provides endpoints for pure vector search, hybrid search, and debugging.",
     version=API_VERSION
 )
 
-@app.post("/hybrid-search/", response_model=List[SearchResult])
-async def hybrid_search(request: VectorSearchRequest):
-    logger.info(f"درخواست جستجوی هیبریدی با {len(request.keywords)} کلمه کلیدی دریافت شد.")
-    if collection is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service is not available: Database not loaded.")
-    if not request.keywords:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Keywords list cannot be empty.")
-
-    try:
-        query_embedding = np.array(request.embedding, dtype=np.float32)
-
-        # --- ✨✨✨ اعتبارسنجی اصلی اینجاست ✨✨✨ ---
-        # چک می‌کنیم که آیا وکتور ورودی یک وکتور صفر است یا نه
-        if np.all(query_embedding == 0):
-            logger.error("وکتور امبدینگ ورودی یک وکتور صفر است و نمی‌تواند برای جستجو استفاده شود.")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="The provided embedding is a zero vector. Cannot perform similarity search."
-            )
-
-        # مرحله ۱: فیلتر کردن با کلیدواژه‌ها
-        all_ids_from_keyword_filter = set()
-        normalized_keywords = [kw.lower() for kw in request.keywords]
-        keyword_batches = [normalized_keywords[i:i + KEYWORD_BATCH_SIZE] for i in range(0, len(normalized_keywords), KEYWORD_BATCH_SIZE)]
-        for batch in keyword_batches:
-            where_filter = {"$or": [{"$contains": kw} for kw in batch]} if len(batch) > 1 else {"$contains": batch[0]}
-            try:
-                batch_results = collection.get(where_document=where_filter, include=[])
-                if batch_results and batch_results.get('ids'):
-                    all_ids_from_keyword_filter.update(batch_results['ids'])
-            except Exception:
-                pass
-
-        if not all_ids_from_keyword_filter:
-            return []
-        
-        if len(all_ids_from_keyword_filter) > MAX_FILTER_RESULTS:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="The provided keywords are too general. Please use more specific keywords to narrow down the search."
-            )
-        
-        unique_ids = list(all_ids_from_keyword_filter)
-        
-        # مرحله ۲: گرفتن اطلاعات کامل محصولات
-        results_keyword = collection.get(ids=unique_ids, include=["documents", "embeddings"])
-        if not results_keyword or not results_keyword.get('ids'):
-            return []
-        
-        # مرحله ۳: محاسبه امن شباهت کسینوسی
-        filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
-        dot_product = np.dot(filtered_embeddings, query_embedding)
-        query_norm = np.linalg.norm(query_embedding)
-        filtered_norms = np.linalg.norm(filtered_embeddings, axis=1)
-        denominator = query_norm * filtered_norms
-        
-        similarities = np.divide(dot_product, denominator, out=np.zeros_like(dot_product, dtype=float), where=denominator!=0)
-
-        reranked_results = []
-        for i, doc_name in enumerate(results_keyword['documents']):
-            reranked_results.append({
-                "id": results_keyword['ids'][i],
-                "name": doc_name,
-                "score": similarities[i] * 100
-            })
-        
-        # مرحله ۴: مرتب‌سازی و انتخاب بهترین‌ها
-        reranked_results.sort(key=lambda x: x['score'], reverse=True)
-        top_results = reranked_results[:TOP_K_RESULTS]
-        
-        logger.info(f"بازگرداندن {len(top_results)} نتیجه نهایی.")
-        return top_results
+# --- 6. توابع همزمان (Sync) ---
+def initialize_database_sync():
+    """فقط دیتابیس را بارگذاری می‌کند."""
+    global collection, app_initialized
+    if not os.path.isdir(DB_PATH):
+        raise FileNotFoundError("Database path does not exist. Please download the database first.")
     
-    except HTTPException as http_exc:
-        raise http_exc
+    logger.info(f"--- در حال اتصال به دیتابیس ChromaDB در مسیر: {DB_PATH} ---")
+    db_client = chromadb.PersistentClient(path=DB_PATH)
+    collection = db_client.get_or_create_collection(name=COLLECTION_NAME)
+    logger.info(f"✅ اتصال به ChromaDB موفقیت‌آمیز بود. کالکشن '{COLLECTION_NAME}' شامل {collection.count()} آیتم است.")
+    app_initialized = True
+
+
+def search_sync_pure_vector(embedding: List[float]) -> List[SearchResult]:
+    """
+    جستجوی وکتوری خالص را انجام می‌دهد و فیلتر کلیدواژه را نادیده می‌گیرد.
+    """
+    logger.info("Performing PURE vector search (keyword filter disabled).")
+    vector_search_results = collection.query(
+        query_embeddings=[embedding],
+        n_results=TOP_K_RESULTS,
+    )
+
+    if not vector_search_results or not vector_search_results.get('ids')[0]:
+        logger.warning("No results found from pure vector search.")
+        return []
+
+    final_results = []
+    ids, distances, documents = vector_search_results['ids'][0], vector_search_results['distances'][0], vector_search_results['documents'][0]
+    for i in range(len(ids)):
+        score = (1 - distances[i]) * 100
+        final_results.append({"id": ids[i], "name": documents[i] if documents else "N/A", "score": score})
+    return final_results
+
+
+def search_sync_hybrid(embedding: List[float], keywords: List[str]) -> List[SearchResult]:
+    """جستجوی ترکیبی با استفاده از وکتور آماده."""
+    logger.info("Performing HYBRID search (keywords first).")
+    where_filter = {"$or": [{"$contains": kw} for kw in keywords]} if len(keywords) > 1 else {"$contains": keywords[0]}
+    
+    results_keyword = collection.get(where_document=where_filter, include=["documents"])
+    
+    if not results_keyword or not results_keyword.get('ids'):
+        logger.warning("No results found after keyword filtering stage.")
+        return []
+        
+    logger.info(f"Found {len(results_keyword['ids'])} results after keyword filter. Reranking...")
+    vector_search_results = collection.query(
+        query_embeddings=[embedding],
+        n_results=TOP_K_RESULTS,
+        where={"id": {"$in": results_keyword['ids']}}
+    )
+
+    if not vector_search_results or not vector_search_results.get('ids')[0]:
+        logger.warning("No results found after reranking stage.")
+        return []
+
+    final_results = []
+    ids, distances, documents = vector_search_results['ids'][0], vector_search_results['distances'][0], vector_search_results['documents'][0]
+    for i in range(len(ids)):
+        score = (1 - distances[i]) * 100
+        final_results.append({"id": ids[i], "name": documents[i], "score": score})
+    return final_results
+
+
+def get_embedding_by_name_sync(product_name: str) -> Optional[List[float]]:
+    """
+    وکتور امبدینگ یک محصول را با استفاده از نام دقیق آن از دیتابیس استخراج می‌کند.
+    """
+    logger.info(f"Debugging: Attempting to retrieve product by name: '{product_name}'")
+    result = collection.get(
+        where_document={"$eq": product_name},
+        include=["embeddings"]
+    )
+    if result and result.get('embeddings'):
+        logger.info(f"✅ Debug: Product '{product_name}' found.")
+        return result['embeddings'][0]
+    else:
+        logger.warning(f"⚠️ Debug: Product '{product_name}' NOT found.")
+        return None
+
+
+
+def start_download(url: str, output_path: Path):
+    """تابع دانلود که در پس‌زمینه اجرا می‌شود."""
+    logger.info(f"🚀 شروع دانلود از {url} به {output_path}")
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        gdown.download(url=url, output=str(output_path), quiet=False, fuzzy=True)
+        logger.info(f"✅ دانلود برای {output_path} کامل شد.")
     except Exception as e:
-        logger.error(f"خطای غیرمنتظره: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An internal server error occurred.")
+        logger.error(f"❌ خطا در دانلود فایل {url}. دلیل: {e}")
+
+# --- 7. Endpoint های API (Asynchronous) ---
+@app.post("/startup/")
+async def startup_server():
+    """Endpoint برای راه‌اندازی دیتابیس."""
+    global app_initialized
+    if app_initialized:
+        return {"status": "warning", "message": "Application is already initialized."}
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, initialize_database_sync)
+        return {"status": "success", "message": "Database initialized successfully."}
+    except Exception as e:
+        app_initialized = False
+        logger.critical(f"❌ راه‌اندازی دیتابیس ناموفق بود: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to initialize database: {str(e)}")
+
+@app.post("/get-files/")
+async def schedule_download(request: DownloadRequest, background_tasks: BackgroundTasks):
+    """Endpoint برای زمان‌بندی دانلود."""
+    full_path = BASE_DATA_DIR.joinpath(request.destination_path).resolve()
+    if BASE_DATA_DIR not in full_path.parents and full_path != BASE_DATA_DIR:
+        raise HTTPException(status_code=400, detail="خطا: مسیر مقصد نامعتبر است.")
+    background_tasks.add_task(start_download, request.drive_link, full_path)
+    return {
+        "status": "success",
+        "message": "وظیفه دانلود با موفقیت زمان‌بندی شد.",
+        "details": {"drive_link": request.drive_link, "save_location": str(full_path)}
+    }
+
+
+@app.post("/vector-search/", response_model=List[SearchResult], summary="Pure Vector Search (Debug)")
+async def vector_search(request: VectorSearchRequest):
+    """
+    Endpoint برای جستجوی وکتوری خالص (فیلتر کلیدواژه را نادیده می‌گیرد).
+    """
+    if not app_initialized:
+        raise HTTPException(status_code=503, detail="Service is not initialized. Please call /startup first.")
+    
+    try:
+        loop = asyncio.get_running_loop()
+        final_results = await loop.run_in_executor(None, search_sync_pure_vector, request.embedding)
+        logger.info(f"Returning {len(final_results)} pure vector search results.")
+        return final_results
+    except Exception as e:
+        logger.error(f"Error during pure vector search: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An error occurred during the search process.")
+
+
+@app.post("/hybrid-search/", response_model=List[SearchResult], summary="Hybrid Search (Production)")
+async def hybrid_search(request: VectorSearchRequest):
+    """Endpoint اصلی جستجوی ترکیبی (ابتدا کلیدواژه، سپس وکتور)."""
+    if not app_initialized:
+        raise HTTPException(status_code=503, detail="Service is not initialized. Please call /startup first.")
+    if not request.keywords:
+        raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
+    try:
+        # ✨✨✨ اصلاح اصلی اینجاست: کلمات کلیدی را به حروف کوچک تبدیل کنید ✨✨✨
+        normalized_keywords = [kw.lower() for kw in request.keywords]
+
+        loop = asyncio.get_running_loop()
+        # از لیست نرمال‌شده در تابع جستجو استفاده کنید
+        final_results = await loop.run_in_executor(None, search_sync_hybrid, request.embedding, normalized_keywords)
+        
+        logger.info(f"Returning {len(final_results)} hybrid search results.")
+        return final_results
+    except Exception as e:
+        logger.error(f"Error during hybrid search: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An error occurred during the search process.")
+
+
+@app.post("/get-embedding/", response_model=DebugResponse, summary="Debug: Get Embedding by Name")
+async def get_embedding_by_name(request: DebugRequest):
+    """
+    یک endpoint برای تست که وکتور ذخیره شده برای یک محصول را با نام دقیق آن برمی‌گرداند.
+    """
+    if not app_initialized:
+        raise HTTPException(status_code=503, detail="Service is not initialized. Please call /startup first.")
+    try:
+        loop = asyncio.get_running_loop()
+        embedding = await loop.run_in_executor(None, get_embedding_by_name_sync, request.product_name)
+        if embedding:
+            return {"product_name": request.product_name, "embedding": embedding}
+        else:
+            raise HTTPException(status_code=404, detail=f"Product '{request.product_name}' not found in the database.")
+    except Exception as e:
+        logger.error(f"Error during debug lookup: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An error occurred during the debug lookup.")
+
+
 
 @app.get("/", summary="Health Check")
 async def read_root():
+    """Endpoint ساده برای بررسی سلامت سرویس."""
     return {
-        "status": "OK" if collection else "Error",
-        "message": "Headless hybrid search server is running." if collection else "Database not loaded.",
-        "version": API_VERSION
+        "status": "OK" if app_initialized else "Pending Initialization",
+        "message": "Server is running. Call /startup to initialize model and DB.",
+        "version": API_VERSION,
+        "initialized": app_initialized
     }

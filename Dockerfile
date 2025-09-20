@@ -1,8 +1,8 @@
 # --- مرحله ۱: بیلد (Builder Stage) ---
-# از ایمیج کامل Alpine برای نصب استفاده می‌کنیم که ابزارهای کامپایل را دارد
+# از ایمیج Alpine برای نصب استفاده می‌کنیم
 FROM python:3.10-alpine as builder
 
-# نصب ابزارهای مورد نیاز برای کامپایل پکیج‌هایی مانند numpy
+# ✨ تغییر اصلی اینجاست: نصب ابزارهای مورد نیاز برای کامپایل پکیج‌ها ✨
 RUN apk add --no-cache build-base
 
 WORKDIR /app
@@ -17,7 +17,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 FROM python:3.10-alpine
 
 # نصب پکیج‌های ضروری زمان اجرا (که قبلا کامپایل شده‌اند)
-# این کار باعث می‌شود ابزارهای build در ایمیج نهایی وجود نداشته باشند
 RUN apk add --no-cache libgomp
 
 WORKDIR /app

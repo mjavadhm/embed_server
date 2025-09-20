@@ -37,6 +37,14 @@ class DownloadRequest(BaseModel):
     drive_link: str
     destination_path: str = ""
 
+class DebugRequest(BaseModel):
+    product_name: str = Field(..., description="نام دقیق فارسی محصول برای جستجو.")
+
+class DebugResponse(BaseModel):
+    product_name: str
+    embedding: List[float]
+
+
 # --- 5. ساخت اپلیکیشن FastAPI ---
 app = FastAPI(
     title="Headless Vector Search API",
@@ -56,6 +64,40 @@ def initialize_database_sync():
     collection = db_client.get_or_create_collection(name=COLLECTION_NAME)
     logger.info(f"✅ اتصال به ChromaDB موفقیت‌آمیز بود. کالکشن '{COLLECTION_NAME}' شامل {collection.count()} آیتم است.")
     app_initialized = True
+
+
+def search_sync_pure_vector(embedding: List[float]) -> List[SearchResult]:
+    """
+    جستجوی وکتوری خالص را انجام می‌دهد و فیلتر کلیدواژه را نادیده می‌گیرد.
+    """
+    logger.info("Performing PURE vector search (keyword filter disabled for debugging).")
+    
+    # مستقیماً کل دیتابیس را برای پیدا کردن نزدیک‌ترین وکتورها جستجو می‌کنیم
+    vector_search_results = collection.query(
+        query_embeddings=[embedding],
+        n_results=TOP_K_RESULTS,
+    )
+
+    if not vector_search_results or not vector_search_results.get('ids')[0]:
+        logger.warning("No results found from pure vector search.")
+        return []
+
+    # آماده‌سازی خروجی نهایی
+    final_results = []
+    ids = vector_search_results['ids'][0]
+    distances = vector_search_results['distances'][0]
+    documents = vector_search_results['documents'][0]
+
+    for i in range(len(ids)):
+        score = (1 - distances[i]) * 100
+        final_results.append({
+            "id": ids[i],
+            "name": documents[i] if documents else "N/A", # اگر documents وجود نداشت، خطا نده
+            "score": score
+        })
+        
+    return final_results
+
 
 def search_sync(embedding: List[float], keywords: List[str]) -> List[SearchResult]:
     """جستجوی ترکیبی با استفاده از وکتور آماده."""
@@ -95,6 +137,26 @@ def search_sync(embedding: List[float], keywords: List[str]) -> List[SearchResul
         })
         
     return final_results
+
+
+def get_embedding_by_name_sync(product_name: str) -> Optional[List[float]]:
+    """
+    وکتور امبدینگ یک محصول را با استفاده از نام دقیق آن از دیتابیس استخراج می‌کند.
+    """
+    logger.info(f"Debugging: Attempting to retrieve product by name: '{product_name}'")
+    # از فیلتر where_document برای پیدا کردن مطابقت دقیق استفاده می‌کنیم
+    result = collection.get(
+        where_document={"$eq": product_name},
+        include=["embeddings"]
+    )
+    if result and result.get('embeddings'):
+        logger.info(f"✅ Debug: Product '{product_name}' found.")
+        return result['embeddings'][0]
+    else:
+        logger.warning(f"⚠️ Debug: Product '{product_name}' NOT found.")
+        return None
+
+
 
 def start_download(url: str, output_path: Path):
     """تابع دانلود که در پس‌زمینه اجرا می‌شود."""
@@ -141,7 +203,27 @@ async def schedule_download(request: DownloadRequest, background_tasks: Backgrou
         }
     }
 
+
 @app.post("/vector-search/", response_model=List[SearchResult])
+async def vector_search(request: VectorSearchRequest):
+    """
+    Endpoint جستجو که از تابع جدید (جستجوی خالص) استفاده می‌کند.
+    """
+    if not app_initialized:
+        raise HTTPException(status_code=503, detail="Service is not initialized. Please call /startup first.")
+    
+    try:
+        loop = asyncio.get_running_loop()
+        # ✨ از تابع جدید استفاده می‌کنیم و کلیدواژه‌ها را نادیده می‌گیریم
+        final_results = await loop.run_in_executor(None, search_sync_pure_vector, request.embedding)
+        logger.info(f"Returning {len(final_results)} search results.")
+        return final_results
+    except Exception as e:
+        logger.error(f"Error during search: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An error occurred during the search process.")
+
+
+@app.post("/hybrid-search/", response_model=List[SearchResult])
 async def vector_search(request: VectorSearchRequest):
     """Endpoint اصلی جستجو که وکتور آماده دریافت می‌کند."""
     if not app_initialized:
@@ -156,6 +238,27 @@ async def vector_search(request: VectorSearchRequest):
     except Exception as e:
         logger.error(f"Error during search: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred during the search process.")
+
+
+@app.post("/get-embedding/", response_model=DebugResponse, summary="Debug: Get Embedding by Name")
+async def get_embedding_by_name(request: DebugRequest):
+    """
+    یک endpoint برای تست که وکتور ذخیره شده برای یک محصول را با نام دقیق آن برمی‌گرداند.
+    """
+    if not app_initialized:
+        raise HTTPException(status_code=503, detail="Service is not initialized. Please call /startup first.")
+    try:
+        loop = asyncio.get_running_loop()
+        embedding = await loop.run_in_executor(None, get_embedding_by_name_sync, request.product_name)
+        if embedding:
+            return {"product_name": request.product_name, "embedding": embedding}
+        else:
+            raise HTTPException(status_code=404, detail=f"Product '{request.product_name}' not found in the database.")
+    except Exception as e:
+        logger.error(f"Error during debug lookup: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An error occurred during the debug lookup.")
+
+
 
 @app.get("/", summary="Health Check")
 async def read_root():

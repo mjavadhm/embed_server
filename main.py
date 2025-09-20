@@ -12,7 +12,7 @@ import gdown
 BASE_DATA_DIR = Path("/app/product_db")
 DB_PATH = str(BASE_DATA_DIR)
 COLLECTION_NAME = "products"
-API_VERSION = "2.3.0-final-debug"
+API_VERSION = "2.4.0-final-debug" # Version updated to reflect changes
 TOP_K_RESULTS = 15
 
 # --- 2. راه‌اندازی لاگ ---
@@ -34,8 +34,9 @@ class SearchResult(BaseModel):
     score: float
 
 class DownloadRequest(BaseModel):
-    drive_link: str
-    destination_path: str = ""
+    drive_link: str = Field(..., description="Google Drive link for the folder to download.")
+    # ### تغییر: destination_path حذف شد چون gdown.download_folder مستقیماً در مسیر پایه ذخیره می‌کند
+    # destination_path: str = ""
 
 class DebugRequest(BaseModel):
     product_name: str = Field(..., description="نام دقیق فارسی محصول برای جستجو.")
@@ -57,7 +58,7 @@ def initialize_database_sync():
     """فقط دیتابیس را بارگذاری می‌کند."""
     global collection, app_initialized
     if not os.path.isdir(DB_PATH):
-        raise FileNotFoundError("Database path does not exist. Please download the database first.")
+        raise FileNotFoundError("Database path does not exist. Please download the database folder first.")
     
     logger.info(f"--- در حال اتصال به دیتابیس ChromaDB در مسیر: {DB_PATH} ---")
     db_client = chromadb.PersistentClient(path=DB_PATH)
@@ -135,16 +136,23 @@ def get_embedding_by_name_sync(product_name: str) -> Optional[List[float]]:
         return None
 
 
-
-def start_download(url: str, output_path: Path):
-    """تابع دانلود که در پس‌زمینه اجرا می‌شود."""
-    logger.info(f"🚀 شروع دانلود از {url} به {output_path}")
+# ### تغییر ۱: تابع دانلود برای پشتیبانی از فولدر بازنویسی شد ###
+def start_folder_download(url: str, output_path: str):
+    """تابع دانلود فولدر که در پس‌زمینه اجرا می‌شود."""
+    logger.info(f"🚀 شروع دانلود فولدر از {url} به مسیر {output_path}")
     try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        gdown.download(url=url, output=str(output_path), quiet=False, fuzzy=True)
-        logger.info(f"✅ دانلود برای {output_path} کامل شد.")
+        # اطمینان از وجود دایرکتوری پایه
+        Path(output_path).mkdir(parents=True, exist_ok=True)
+        # استفاده از gdown.download_folder برای دانلود کل فولدر
+        gdown.download_folder(url=url, output=output_path, quiet=False, use_cookies=False)
+        logger.info(f"✅ دانلود فولدر در مسیر {output_path} کامل شد.")
+        # پس از دانلود، می‌توانیم به صورت خودکار دیتابیس را مقداردهی اولیه کنیم
+        # این بخش اختیاری است
+        logger.info("تلاش برای راه‌اندازی خودکار دیتابیس پس از دانلود...")
+        initialize_database_sync()
     except Exception as e:
-        logger.error(f"❌ خطا در دانلود فایل {url}. دلیل: {e}")
+        logger.error(f"❌ خطا در دانلود فولدر {url}. دلیل: {e}", exc_info=True)
+
 
 # --- 7. Endpoint های API (Asynchronous) ---
 @app.post("/startup/")
@@ -161,17 +169,17 @@ async def startup_server():
         logger.critical(f"❌ راه‌اندازی دیتابیس ناموفق بود: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to initialize database: {str(e)}")
 
-@app.post("/get-files/")
-async def schedule_download(request: DownloadRequest, background_tasks: BackgroundTasks):
-    """Endpoint برای زمان‌بندی دانلود."""
-    full_path = BASE_DATA_DIR.joinpath(request.destination_path).resolve()
-    if BASE_DATA_DIR not in full_path.parents and full_path != BASE_DATA_DIR:
-        raise HTTPException(status_code=400, detail="خطا: مسیر مقصد نامعتبر است.")
-    background_tasks.add_task(start_download, request.drive_link, full_path)
+
+# ### تغییر ۲: Endpoint دانلود برای کار با فولدر به‌روزرسانی شد ###
+@app.post("/download-database/")
+async def schedule_folder_download(request: DownloadRequest, background_tasks: BackgroundTasks):
+    """Endpoint برای زمان‌بندی دانلود کل فولدر دیتابیس."""
+    # مسیر مقصد ثابت و برابر با DB_PATH است
+    background_tasks.add_task(start_folder_download, request.drive_link, DB_PATH)
     return {
         "status": "success",
-        "message": "وظیفه دانلود با موفقیت زمان‌بندی شد.",
-        "details": {"drive_link": request.drive_link, "save_location": str(full_path)}
+        "message": "وظیفه دانلود فولدر دیتابیس با موفقیت زمان‌بندی شد.",
+        "details": {"drive_link": request.drive_link, "save_location": DB_PATH}
     }
 
 
@@ -201,11 +209,8 @@ async def hybrid_search(request: VectorSearchRequest):
     if not request.keywords:
         raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
     try:
-        # ✨✨✨ اصلاح اصلی اینجاست: کلمات کلیدی را به حروف کوچک تبدیل کنید ✨✨✨
         normalized_keywords = [kw.lower() for kw in request.keywords]
-
         loop = asyncio.get_running_loop()
-        # از لیست نرمال‌شده در تابع جستجو استفاده کنید
         final_results = await loop.run_in_executor(None, search_sync_hybrid, request.embedding, normalized_keywords)
         
         logger.info(f"Returning {len(final_results)} hybrid search results.")
@@ -240,7 +245,7 @@ async def read_root():
     """Endpoint ساده برای بررسی سلامت سرویس."""
     return {
         "status": "OK" if app_initialized else "Pending Initialization",
-        "message": "Server is running. Call /startup to initialize model and DB.",
+        "message": "Server is running. Call /startup to initialize model and DB, or /download-database to get it first.",
         "version": API_VERSION,
         "initialized": app_initialized
     }

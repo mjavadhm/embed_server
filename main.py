@@ -1,112 +1,103 @@
 import logging
 import os
-import torch
-import numpy as np
 import chromadb
 import asyncio
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import List
-from sentence_transformers import SentenceTransformer, util
-import gdown
 from pathlib import Path
+import gdown
 
 # --- 1. پیکربندی و ثابت‌ها ---
 BASE_DATA_DIR = Path("/app/product_db")
 DB_PATH = str(BASE_DATA_DIR)
-MODEL_PATH = str(BASE_DATA_DIR / "embedding_model")
 COLLECTION_NAME = "products"
-API_VERSION = "1.2.0-async"
+API_VERSION = "2.0.0-headless"
 TOP_K_RESULTS = 15
 
 # --- 2. راه‌اندازی لاگ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- 3. متغیرهای سراسری برای مدل و دیتابیس ---
-model: SentenceTransformer = None
+# --- 3. متغیرهای سراسری ---
 collection = None
 app_initialized = False
 
 # --- 4. مدل‌های Pydantic ---
-class HybridSearchRequest(BaseModel):
-    query: str = Field(..., description="The full-text query for semantic search.", example="velvet kitchen rug")
+class VectorSearchRequest(BaseModel):
+    embedding: List[float] = Field(..., description="The pre-computed embedding vector for the query.")
     keywords: List[str] = Field(..., description="A list of keywords for initial filtering.", example=["rug", "velvet"])
 
 class SearchResult(BaseModel):
-    id: str = Field(..., description="Unique identifier of the product.")
-    name: str = Field(..., description="The Persian name of the product.")
-    score: float = Field(..., description="The semantic similarity score as a percentage (0-100).")
+    id: str
+    name: str
+    score: float
 
 class DownloadRequest(BaseModel):
-    drive_link: str = Field(..., description="لینک اشتراک‌گذاری فایل در گوگل درایو")
-    destination_path: str = Field("", description="مسیر نسبی برای ذخیره فایل روی دیسک (مثال: embedding_model)")
+    drive_link: str
+    destination_path: str = ""
 
 # --- 5. ساخت اپلیکیشن FastAPI ---
 app = FastAPI(
-    title="Async Unified Hybrid Search and Downloader API",
-    description="An asynchronous API that downloads files, initializes a search model, and performs hybrid search.",
+    title="Headless Vector Search API",
+    description="An API that receives pre-computed embeddings and performs a hybrid search in ChromaDB.",
     version=API_VERSION
 )
 
-# --- 6. توابع همزمان (Sync) برای اجرا در Thread Pool ---
-def initialize_components_sync():
-    """
-    نسخه همزمان (sync) تابع راه‌اندازی که شامل کدهای blocking است.
-    این تابع در یک thread جداگانه اجرا خواهد شد.
-    """
-    global model, collection, app_initialized
-    if not os.path.exists(MODEL_PATH) or not os.path.isdir(DB_PATH):
-        raise FileNotFoundError("Model or Database path does not exist. Please download files first.")
+# --- 6. توابع همزمان (Sync) ---
+def initialize_database_sync():
+    """فقط دیتابیس را بارگذاری می‌کند."""
+    global collection, app_initialized
+    if not os.path.isdir(DB_PATH):
+        raise FileNotFoundError("Database path does not exist. Please download the database first.")
     
-    logger.info("--- در حال راه‌اندازی کامپوننت‌های برنامه از مسیرهای محلی ---")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"در حال بارگذاری مدل از مسیر: {MODEL_PATH} روی دستگاه: '{device}'")
-    model = SentenceTransformer(MODEL_PATH, device=device)
-    logger.info("✅ مدل امبدینگ با موفقیت بارگذاری شد.")
-
-    logger.info(f"در حال اتصال به دیتابیس ChromaDB در مسیر: {DB_PATH}")
+    logger.info(f"--- در حال اتصال به دیتابیس ChromaDB در مسیر: {DB_PATH} ---")
     db_client = chromadb.PersistentClient(path=DB_PATH)
     collection = db_client.get_or_create_collection(name=COLLECTION_NAME)
     logger.info(f"✅ اتصال به ChromaDB موفقیت‌آمیز بود. کالکشن '{COLLECTION_NAME}' شامل {collection.count()} آیتم است.")
-    
     app_initialized = True
 
-def search_sync(query: str, keywords: List[str]) -> List[SearchResult]:
-    """
-    نسخه همزمان (sync) تابع جستجو. تمام کدهای سنگین CPU-bound اینجا هستند.
-    این تابع در یک thread جداگانه اجرا خواهد شد.
-    """
-    # فیلتر بر اساس کلیدواژه
+def search_sync(embedding: List[float], keywords: List[str]) -> List[SearchResult]:
+    """جستجوی ترکیبی با استفاده از وکتور آماده."""
+    # مرحله ۱: فیلتر اولیه با کلیدواژه
     where_filter = {"$or": [{"$contains": kw} for kw in keywords]} if len(keywords) > 1 else {"$contains": keywords[0]}
-    results_keyword = collection.get(where_document=where_filter, include=["documents", "embeddings"])
+    
+    # در این مرحله فقط اسناد (documents) و شناسه‌ها (ids) را می‌گیریم، چون به امبدینگ‌هایشان برای مقایسه نیازی نداریم
+    results_keyword = collection.get(where_document=where_filter, include=["documents"])
     
     if not results_keyword or not results_keyword.get('ids'):
-        logger.info("پس از فیلتر کلیدواژه نتیجه‌ای یافت نشد.")
+        return []
+        
+    # مرحله ۲: جستجوی معنایی روی نتایج فیلتر شده
+    # ChromaDB به صورت داخلی شباهت کسینوسی را محاسبه می‌کند
+    vector_search_results = collection.query(
+        query_embeddings=[embedding],
+        n_results=TOP_K_RESULTS,
+        where={"id": {"$in": results_keyword['ids']}} # جستجو فقط روی اسنادی که از فیلتر رد شده‌اند
+    )
+
+    if not vector_search_results or not vector_search_results.get('ids')[0]:
         return []
 
-    logger.info(f"تعداد {len(results_keyword['ids'])} نتیجه پس از فیلتر کلیدواژه یافت شد. در حال رتبه‌بندی مجدد...")
+    # آماده‌سازی خروجی نهایی
+    final_results = []
+    ids = vector_search_results['ids'][0]
+    distances = vector_search_results['distances'][0]
+    documents = vector_search_results['documents'][0]
 
-    # رتبه‌بندی مجدد با جستجوی معنایی (بخش سنگین)
-    full_query_embedding = model.encode(query)
-    filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
-    similarities = util.cos_sim(full_query_embedding, filtered_embeddings)
-
-    reranked_results = [
-        {
-            "id": results_keyword['ids'][i],
-            "name": doc_name,
-            "score": similarities[0][i].item() * 100
-        }
-        for i, doc_name in enumerate(results_keyword['documents'])
-    ]
-    
-    reranked_results.sort(key=lambda x: x['score'], reverse=True)
-    return reranked_results[:TOP_K_RESULTS]
+    for i in range(len(ids)):
+        # تبدیل فاصله (distance) به امتیاز شباهت (similarity score)
+        score = (1 - distances[i]) * 100
+        final_results.append({
+            "id": ids[i],
+            "name": documents[i],
+            "score": score
+        })
+        
+    return final_results
 
 def start_download(url: str, output_path: Path):
-    """تابع دانلود که در پس‌زمینه اجرا می‌شود (این بخش نیازی به async ندارد)."""
-    # ... (بدون تغییر)
+    """تابع دانلود که در پس‌زمینه اجرا می‌شود."""
     logger.info(f"🚀 شروع دانلود از {url} به {output_path}")
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,22 +109,17 @@ def start_download(url: str, output_path: Path):
 # --- 7. Endpoint های API (Asynchronous) ---
 @app.post("/startup/")
 async def startup_server():
-    """
-    Endpoint غیرهمزمان (async) برای راه‌اندازی مدل و دیتابیس.
-    """
+    """Endpoint برای راه‌اندازی دیتابیس."""
     global app_initialized
     if app_initialized:
         return {"status": "warning", "message": "Application is already initialized."}
-    
     try:
-        # اجرای تابع blocking در یک thread جداگانه
-        await asyncio.get_running_loop().run_in_executor(None, initialize_components_sync)
-        return {"status": "success", "message": "کامپوننت‌های برنامه با موفقیت راه‌اندازی شدند."}
+        await asyncio.get_running_loop().run_in_executor(None, initialize_database_sync)
+        return {"status": "success", "message": "Database initialized successfully."}
     except Exception as e:
-        # ریست کردن وضعیت در صورت بروز خطا
         app_initialized = False
-        logger.critical(f"❌ راه‌اندازی ناموفق بود: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"راه‌اندازی ناموفق بود: {str(e)}")
+        logger.critical(f"❌ راه‌اندازی دیتابیس ناموفق بود: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to initialize database: {str(e)}")
 
 @app.post("/get-files/")
 async def schedule_download(request: DownloadRequest, background_tasks: BackgroundTasks):
@@ -155,32 +141,21 @@ async def schedule_download(request: DownloadRequest, background_tasks: Backgrou
         }
     }
 
-@app.post("/hybrid-search/", response_model=List[SearchResult])
-async def hybrid_search(request: HybridSearchRequest):
-    """
-    ✨ Endpoint اصلی جستجو که به صورت غیرهمزمان (async) اجرا می‌شود. ✨
-    """
-    if not app_initialized or collection is None or model is None:
-        raise HTTPException(status_code=503, detail="سرویس در دسترس نیست. لطفاً ابتدا /startup را فراخوانی کنید.")
-
+@app.post("/vector-search/", response_model=List[SearchResult])
+async def vector_search(request: VectorSearchRequest):
+    """Endpoint اصلی جستجو که وکتور آماده دریافت می‌کند."""
+    if not app_initialized:
+        raise HTTPException(status_code=503, detail="Service is not initialized. Please call /startup first.")
     if not request.keywords:
-        raise HTTPException(status_code=400, detail="لیست کلیدواژه‌ها نمی‌تواند خالی باشد.")
-
+        raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
     try:
-        # اجرای تابع سنگین و همزمانِ جستجو در یک thread جداگانه
-        # این کار از مسدود شدن event loop جلوگیری می‌کند
         loop = asyncio.get_running_loop()
-        final_results = await loop.run_in_executor(
-            None,  # استفاده از thread pool پیش‌فرض
-            search_sync,  # تابع همزمانی که باید اجرا شود
-            request.query,  # آرگومان‌های تابع
-            request.keywords
-        )
-        logger.info(f"بازگرداندن {len(final_results)} نتیجه نهایی.")
+        final_results = await loop.run_in_executor(None, search_sync, request.embedding, request.keywords)
+        logger.info(f"Returning {len(final_results)} search results.")
         return final_results
     except Exception as e:
-        logger.error(f"خطا در حین جستجو: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="خطایی در حین فرآیند جستجو رخ داد.")
+        logger.error(f"Error during search: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An error occurred during the search process.")
 
 @app.get("/", summary="Health Check")
 async def read_root():

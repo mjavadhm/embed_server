@@ -14,13 +14,13 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # --- 5. Copy ONLY your application code ---
-# The database and model will now be mounted as volumes at runtime.
-# This keeps the image small and the data persistent.
-COPY ./main.py . # Assuming your python file is named main.py
+# !!! IMPORTANT: Change 'api.py' to the actual name of your Python file !!!
+COPY ./main.py . 
 
 # --- 6. Expose the port the app runs on ---
 EXPOSE 8000
 
 # --- 7. Define the command to run your application ---
+# !!! IMPORTANT: Change 'api' to the name of your file (without .py) !!!
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 

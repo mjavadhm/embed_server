@@ -4,7 +4,7 @@ import chromadb
 import asyncio
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 import gdown
 
@@ -12,7 +12,7 @@ import gdown
 BASE_DATA_DIR = Path("/app/product_db")
 DB_PATH = str(BASE_DATA_DIR)
 COLLECTION_NAME = "products"
-API_VERSION = "2.0.0-headless"
+API_VERSION = "2.3.0-final-debug"
 TOP_K_RESULTS = 15
 
 # --- 2. راه‌اندازی لاگ ---
@@ -47,8 +47,8 @@ class DebugResponse(BaseModel):
 
 # --- 5. ساخت اپلیکیشن FastAPI ---
 app = FastAPI(
-    title="Headless Vector Search API",
-    description="An API that receives pre-computed embeddings and performs a hybrid search in ChromaDB.",
+    title="Headless Vector Search API (Debug & Production Ready)",
+    description="Provides endpoints for pure vector search, hybrid search, and debugging.",
     version=API_VERSION
 )
 
@@ -70,9 +70,7 @@ def search_sync_pure_vector(embedding: List[float]) -> List[SearchResult]:
     """
     جستجوی وکتوری خالص را انجام می‌دهد و فیلتر کلیدواژه را نادیده می‌گیرد.
     """
-    logger.info("Performing PURE vector search (keyword filter disabled for debugging).")
-    
-    # مستقیماً کل دیتابیس را برای پیدا کردن نزدیک‌ترین وکتورها جستجو می‌کنیم
+    logger.info("Performing PURE vector search (keyword filter disabled).")
     vector_search_results = collection.query(
         query_embeddings=[embedding],
         n_results=TOP_K_RESULTS,
@@ -82,60 +80,41 @@ def search_sync_pure_vector(embedding: List[float]) -> List[SearchResult]:
         logger.warning("No results found from pure vector search.")
         return []
 
-    # آماده‌سازی خروجی نهایی
     final_results = []
-    ids = vector_search_results['ids'][0]
-    distances = vector_search_results['distances'][0]
-    documents = vector_search_results['documents'][0]
-
+    ids, distances, documents = vector_search_results['ids'][0], vector_search_results['distances'][0], vector_search_results['documents'][0]
     for i in range(len(ids)):
         score = (1 - distances[i]) * 100
-        final_results.append({
-            "id": ids[i],
-            "name": documents[i] if documents else "N/A", # اگر documents وجود نداشت، خطا نده
-            "score": score
-        })
-        
+        final_results.append({"id": ids[i], "name": documents[i] if documents else "N/A", "score": score})
     return final_results
 
 
-def search_sync(embedding: List[float], keywords: List[str]) -> List[SearchResult]:
+def search_sync_hybrid(embedding: List[float], keywords: List[str]) -> List[SearchResult]:
     """جستجوی ترکیبی با استفاده از وکتور آماده."""
-    # مرحله ۱: فیلتر اولیه با کلیدواژه
+    logger.info("Performing HYBRID search (keywords first).")
     where_filter = {"$or": [{"$contains": kw} for kw in keywords]} if len(keywords) > 1 else {"$contains": keywords[0]}
     
-    # در این مرحله فقط اسناد (documents) و شناسه‌ها (ids) را می‌گیریم، چون به امبدینگ‌هایشان برای مقایسه نیازی نداریم
     results_keyword = collection.get(where_document=where_filter, include=["documents"])
     
     if not results_keyword or not results_keyword.get('ids'):
+        logger.warning("No results found after keyword filtering stage.")
         return []
         
-    # مرحله ۲: جستجوی معنایی روی نتایج فیلتر شده
-    # ChromaDB به صورت داخلی شباهت کسینوسی را محاسبه می‌کند
+    logger.info(f"Found {len(results_keyword['ids'])} results after keyword filter. Reranking...")
     vector_search_results = collection.query(
         query_embeddings=[embedding],
         n_results=TOP_K_RESULTS,
-        where={"id": {"$in": results_keyword['ids']}} # جستجو فقط روی اسنادی که از فیلتر رد شده‌اند
+        where={"id": {"$in": results_keyword['ids']}}
     )
 
     if not vector_search_results or not vector_search_results.get('ids')[0]:
+        logger.warning("No results found after reranking stage.")
         return []
 
-    # آماده‌سازی خروجی نهایی
     final_results = []
-    ids = vector_search_results['ids'][0]
-    distances = vector_search_results['distances'][0]
-    documents = vector_search_results['documents'][0]
-
+    ids, distances, documents = vector_search_results['ids'][0], vector_search_results['distances'][0], vector_search_results['documents'][0]
     for i in range(len(ids)):
-        # تبدیل فاصله (distance) به امتیاز شباهت (similarity score)
         score = (1 - distances[i]) * 100
-        final_results.append({
-            "id": ids[i],
-            "name": documents[i],
-            "score": score
-        })
-        
+        final_results.append({"id": ids[i], "name": documents[i], "score": score})
     return final_results
 
 
@@ -144,7 +123,6 @@ def get_embedding_by_name_sync(product_name: str) -> Optional[List[float]]:
     وکتور امبدینگ یک محصول را با استفاده از نام دقیق آن از دیتابیس استخراج می‌کند.
     """
     logger.info(f"Debugging: Attempting to retrieve product by name: '{product_name}'")
-    # از فیلتر where_document برای پیدا کردن مطابقت دقیق استفاده می‌کنیم
     result = collection.get(
         where_document={"$eq": product_name},
         include=["embeddings"]
@@ -185,58 +163,51 @@ async def startup_server():
 
 @app.post("/get-files/")
 async def schedule_download(request: DownloadRequest, background_tasks: BackgroundTasks):
-    """Endpoint برای زمان‌بندی دانلود (این بخش می‌تواند async باشد ولی ضروری نیست)."""
-    # ... (بدون تغییر)
+    """Endpoint برای زمان‌بندی دانلود."""
     full_path = BASE_DATA_DIR.joinpath(request.destination_path).resolve()
     if BASE_DATA_DIR not in full_path.parents and full_path != BASE_DATA_DIR:
-        raise HTTPException(
-            status_code=400,
-            detail="خطا: مسیر مقصد نامعتبر است."
-        )
+        raise HTTPException(status_code=400, detail="خطا: مسیر مقصد نامعتبر است.")
     background_tasks.add_task(start_download, request.drive_link, full_path)
     return {
         "status": "success",
         "message": "وظیفه دانلود با موفقیت زمان‌بندی شد.",
-        "details": {
-            "drive_link": request.drive_link,
-            "save_location": str(full_path)
-        }
+        "details": {"drive_link": request.drive_link, "save_location": str(full_path)}
     }
 
 
-@app.post("/vector-search/", response_model=List[SearchResult])
+@app.post("/vector-search/", response_model=List[SearchResult], summary="Pure Vector Search (Debug)")
 async def vector_search(request: VectorSearchRequest):
     """
-    Endpoint جستجو که از تابع جدید (جستجوی خالص) استفاده می‌کند.
+    Endpoint برای جستجوی وکتوری خالص (فیلتر کلیدواژه را نادیده می‌گیرد).
     """
     if not app_initialized:
         raise HTTPException(status_code=503, detail="Service is not initialized. Please call /startup first.")
     
     try:
         loop = asyncio.get_running_loop()
-        # ✨ از تابع جدید استفاده می‌کنیم و کلیدواژه‌ها را نادیده می‌گیریم
         final_results = await loop.run_in_executor(None, search_sync_pure_vector, request.embedding)
-        logger.info(f"Returning {len(final_results)} search results.")
+        logger.info(f"Returning {len(final_results)} pure vector search results.")
         return final_results
     except Exception as e:
-        logger.error(f"Error during search: {e}", exc_info=True)
+        logger.error(f"Error during pure vector search: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred during the search process.")
 
 
-@app.post("/hybrid-search/", response_model=List[SearchResult])
-async def vector_search(request: VectorSearchRequest):
-    """Endpoint اصلی جستجو که وکتور آماده دریافت می‌کند."""
+# ✨✨✨ اینجا اصلاح شد ✨✨✨
+@app.post("/hybrid-search/", response_model=List[SearchResult], summary="Hybrid Search (Production)")
+async def hybrid_search(request: VectorSearchRequest):
+    """Endpoint اصلی جستجوی ترکیبی (ابتدا کلیدواژه، سپس وکتور)."""
     if not app_initialized:
         raise HTTPException(status_code=503, detail="Service is not initialized. Please call /startup first.")
     if not request.keywords:
         raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
     try:
         loop = asyncio.get_running_loop()
-        final_results = await loop.run_in_executor(None, search_sync, request.embedding, request.keywords)
-        logger.info(f"Returning {len(final_results)} search results.")
+        final_results = await loop.run_in_executor(None, search_sync_hybrid, request.embedding, request.keywords)
+        logger.info(f"Returning {len(final_results)} hybrid search results.")
         return final_results
     except Exception as e:
-        logger.error(f"Error during search: {e}", exc_info=True)
+        logger.error(f"Error during hybrid search: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred during the search process.")
 
 
@@ -269,3 +240,4 @@ async def read_root():
         "version": API_VERSION,
         "initialized": app_initialized
     }
+

@@ -89,17 +89,49 @@ def search_sync_pure_vector(embedding: List[float]) -> List[SearchResult]:
 
 
 def search_sync_hybrid(embedding: List[float], keywords: List[str]) -> List[SearchResult]:
-    """جستجوی ترکیبی با استفاده از وکتور آماده."""
-    logger.info("Performing HYBRID search (keywords first).")
-    where_filter = {"$or": [{"$contains": kw} for kw in keywords]} if len(keywords) > 1 else {"$contains": keywords[0]}
+    """
+    جستجوی ترکیبی با تقسیم کلیدواژه‌ها به دسته‌های کوچک‌تر برای جلوگیری از خطای دیتابیس.
+    """
+    logger.info(f"Performing HYBRID search with {len(keywords)} keywords.")
     
-    results_keyword = collection.get(where_document=where_filter, include=["documents"])
-    
+    # اگر تعداد کلیدواژه‌ها کم است، از روش قبلی استفاده کن
+    if len(keywords) <= KEYWORD_BATCH_SIZE:
+        where_filter = {"$or": [{"$contains": kw} for kw in keywords]} if len(keywords) > 1 else {"$contains": keywords[0]}
+        results_keyword = collection.get(where_document=where_filter, include=["documents"])
+    else:
+        # اگر تعداد کلیدواژه‌ها زیاد است، آن‌ها را دسته‌بندی کن
+        logger.info(f"Keyword count exceeds batch size. Splitting into chunks of {KEYWORD_BATCH_SIZE}.")
+        all_ids = set()
+        
+        # تقسیم لیست کلیدواژه‌ها به دسته‌های کوچک‌تر
+        keyword_batches = [keywords[i:i + KEYWORD_BATCH_SIZE] for i in range(0, len(keywords), KEYWORD_BATCH_SIZE)]
+        
+        for batch in keyword_batches:
+            logger.info(f"Processing keyword batch with {len(batch)} items.")
+            where_filter = {"$or": [{"$contains": kw} for kw in batch]}
+            try:
+                batch_results = collection.get(where_document=where_filter, include=[]) # فقط آی‌دی‌ها را لازم داریم
+                if batch_results and batch_results.get('ids'):
+                    all_ids.update(batch_results['ids'])
+            except Exception as e:
+                logger.warning(f"A batch query failed, but continuing. Error: {e}")
+
+        if not all_ids:
+            logger.warning("No results found after keyword filtering stage.")
+            return []
+            
+        # ساخت یک دیکشنری نتیجه ساختگی برای سازگاری با بقیه کد
+        results_keyword = {'ids': list(all_ids)}
+
     if not results_keyword or not results_keyword.get('ids'):
         logger.warning("No results found after keyword filtering stage.")
         return []
         
-    logger.info(f"Found {len(results_keyword['ids'])} results after keyword filter. Reranking...")
+    logger.info(f"Found {len(results_keyword['ids'])} unique results after keyword filter. Reranking...")
+    
+    # مرحله نهایی: جستجوی وکتوری روی آی‌دی‌های پیدا شده
+    # نکته: اگر تعداد آی‌دی‌ها خیلی زیاد باشد (مثلا چند ده هزار)، این بخش هم ممکن است کند شود
+    # اما معمولا بسیار سریع‌تر از جستجوی متنی است.
     vector_search_results = collection.query(
         query_embeddings=[embedding],
         n_results=TOP_K_RESULTS,
@@ -116,7 +148,6 @@ def search_sync_hybrid(embedding: List[float], keywords: List[str]) -> List[Sear
         score = (1 - distances[i]) * 100
         final_results.append({"id": ids[i], "name": documents[i], "score": score})
     return final_results
-
 
 def get_embedding_by_name_sync(product_name: str) -> Optional[List[float]]:
     """

@@ -1,33 +1,32 @@
 # --- مرحله ۱: بیلد (Builder Stage) ---
-# از ایمیج Alpine برای نصب استفاده می‌کنیم
 FROM python:3.10-alpine as builder
 
-# ✨ تغییر اصلی اینجاست: نصب ابزارهای مورد نیاز برای کامپایل پکیج‌ها ✨
-RUN apk add --no-cache build-base
+# ✨ متغیر برای پاک کردن کش. با تغییر این عدد، بیلد جدید اجباری می‌شود. ✨
+ENV CACHE_BUSTER=1
+
+# نصب تمام ابزارهای کامپایل مورد نیاز
+# build-base: ابزارهای اصلی کامپایل
+# libffi-dev, openssl-dev: برای برخی کتابخانه‌های رمزنگاری و شبکه
+RUN apk add --no-cache build-base g++ libffi-dev openssl-dev
 
 WORKDIR /app
 
-# کپی و نصب نیازمندی‌ها
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 
 # --- مرحله ۲: نهایی (Final Stage) ---
-# از ایمیج بسیار سبک Alpine برای اجرای برنامه استفاده می‌کنیم
 FROM python:3.10-alpine
 
-# نصب پکیج‌های ضروری زمان اجرا (که قبلا کامپایل شده‌اند)
-RUN apk add --no-cache libgomp
+# فقط کتابخانه‌های زمان اجرا را نصب می‌کنیم
+RUN apk add --no-cache libgomp libffi
 
 WORKDIR /app
 
-# ایجاد دایرکتوری برای دیسک پایدار
 RUN mkdir -p /app/product_db
 
-# فقط پکیج‌های نصب شده از مرحله قبل را کپی می‌کنیم
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 
-# کد برنامه را کپی می‌کنیم
 COPY main.py .
 
 EXPOSE 8000

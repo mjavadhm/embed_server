@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # --- 3. متغیرهای سراسری ---
 collection = None
 app_initialized = False
+KEYWORD_BATCH_SIZE = 100
 
 # --- 4. مدل‌های Pydantic ---
 class VectorSearchRequest(BaseModel):

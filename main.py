@@ -26,7 +26,7 @@ try:
     logger.info("--- Initializing application components from local paths ---")
 
     # Determine device (CPU is expected in the Docker container)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     logger.info(f"Loading sentence transformer model from local path: {MODEL_PATH} onto device: '{device}'")
     
     # Load the model from the local directory inside the container

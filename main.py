@@ -193,7 +193,6 @@ async def vector_search(request: VectorSearchRequest):
         raise HTTPException(status_code=500, detail="An error occurred during the search process.")
 
 
-# ✨✨✨ اینجا اصلاح شد ✨✨✨
 @app.post("/hybrid-search/", response_model=List[SearchResult], summary="Hybrid Search (Production)")
 async def hybrid_search(request: VectorSearchRequest):
     """Endpoint اصلی جستجوی ترکیبی (ابتدا کلیدواژه، سپس وکتور)."""
@@ -202,8 +201,13 @@ async def hybrid_search(request: VectorSearchRequest):
     if not request.keywords:
         raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
     try:
+        # ✨✨✨ اصلاح اصلی اینجاست: کلمات کلیدی را به حروف کوچک تبدیل کنید ✨✨✨
+        normalized_keywords = [kw.lower() for kw in request.keywords]
+
         loop = asyncio.get_running_loop()
-        final_results = await loop.run_in_executor(None, search_sync_hybrid, request.embedding, request.keywords)
+        # از لیست نرمال‌شده در تابع جستجو استفاده کنید
+        final_results = await loop.run_in_executor(None, search_sync_hybrid, request.embedding, normalized_keywords)
+        
         logger.info(f"Returning {len(final_results)} hybrid search results.")
         return final_results
     except Exception as e:

@@ -7,12 +7,11 @@ from pydantic import BaseModel, Field
 from typing import List
 
 # --- 1. پیکربندی و ثابت‌ها ---
-DB_PATH = "/app/product_db"
+DB_PATH = "product_db"
 COLLECTION_NAME = "products"
-API_VERSION = "2.3.0-headless-final"
+API_VERSION = "2.4.0-headless-stable-scoring"
 TOP_K_RESULTS = 15
 KEYWORD_BATCH_SIZE = 100
-# ✨ آستانه جدید برای جلوگیری از خطای "too many SQL variables"
 MAX_FILTER_RESULTS = 20000 
 
 # --- 2. راه‌اندازی لاگ ---
@@ -41,8 +40,8 @@ class SearchResult(BaseModel):
 
 # --- 5. اپلیکیشن FastAPI ---
 app = FastAPI(
-    title="Final Robust Headless Hybrid Search API",
-    description="یک API کامل، سبک و مقاوم برای جستجوی ترکیبی.",
+    title="Stable Scoring Headless Hybrid Search API",
+    description="یک API کامل، سبک و مقاوم با سیستم امتیازدهی اصلاح شده برای جستجوی ترکیبی.",
     version=API_VERSION
 )
 
@@ -71,12 +70,11 @@ async def hybrid_search(request: VectorSearchRequest):
         if not all_ids_from_keyword_filter:
             return []
         
-        # --- ✨✨✨ منطق اصلی برای مدیریت نتایج بیش از حد اینجاست ✨✨✨ ---
         if len(all_ids_from_keyword_filter) > MAX_FILTER_RESULTS:
             logger.warning(f"فیلتر اولیه {len(all_ids_from_keyword_filter)} نتیجه برگرداند که از آستانه {MAX_FILTER_RESULTS} بیشتر است.")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="The provided keywords are too general and resulted in too many matches. Please use more specific keywords to narrow down the search."
+                detail="The provided keywords are too general. Please use more specific keywords to narrow down the search."
             )
         
         unique_ids = list(all_ids_from_keyword_filter)
@@ -89,19 +87,24 @@ async def hybrid_search(request: VectorSearchRequest):
         
         logger.info(f"اطلاعات کامل برای {len(results_keyword['ids'])} محصول دریافت شد. در حال رتبه‌بندی مجدد...")
 
-        # مرحله ۳: محاسبه شباهت با NumPy به روشی امن
+        # --- ✨✨✨ تغییر اصلی: محاسبه امن شباهت کسینوسی ✨✨✨ ---
+        
+        # مرحله ۳: محاسبه شباهت با NumPy به روشی امن و استاندارد
         query_embedding = np.array(request.embedding, dtype=np.float32)
         filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
-        epsilon = 1e-12
+
+        # محاسبه ضرب داخلی
+        dot_product = np.dot(filtered_embeddings, query_embedding)
+
+        # محاسبه نرم (طول) وکتورها
+        query_norm = np.linalg.norm(query_embedding)
+        filtered_norms = np.linalg.norm(filtered_embeddings, axis=1)
+
+        # محاسبه مخرج کسر برای شباهت کسینوسی
+        denominator = query_norm * filtered_norms
         
-        query_norm_val = np.linalg.norm(query_embedding)
-        filtered_norms_val = np.linalg.norm(filtered_embeddings, axis=1, keepdims=True)
-        
-        query_norm = query_embedding / (query_norm_val + epsilon)
-        filtered_norms = filtered_embeddings / (filtered_norms_val + epsilon)
-        
-        similarities = np.dot(filtered_norms, query_norm)
-        similarities = np.nan_to_num(similarities)
+        # تقسیم امن: فقط در جایی که مخرج صفر نیست تقسیم انجام شود، در غیر این صورت حاصل صفر خواهد بود
+        similarities = np.divide(dot_product, denominator, out=np.zeros_like(dot_product, dtype=float), where=denominator!=0)
 
         reranked_results = []
         for i, doc_name in enumerate(results_keyword['documents']):
@@ -119,7 +122,6 @@ async def hybrid_search(request: VectorSearchRequest):
         return top_results
     
     except HTTPException as http_exc:
-        # این برای این است که خطای مشخص ما دوباره گرفته نشود
         raise http_exc
     except Exception as e:
         logger.error(f"خطای غیرمنتظره: {e}", exc_info=True)

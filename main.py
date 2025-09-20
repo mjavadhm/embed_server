@@ -12,7 +12,7 @@ COLLECTION_NAME = "products"
 API_VERSION = "2.1.0-headless-lightweight"
 TOP_K_RESULTS = 15
 KEYWORD_BATCH_SIZE = 100
-ID_RERANK_BATCH_SIZE = 500
+ID_RERANK_BATCH_SIZE = 500 # این متغیر در این نسخه استفاده نمی‌شود ولی برای آینده نگه داشته شده
 
 # --- 2. راه‌اندازی لاگ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,7 +29,7 @@ except Exception as e:
     logger.critical(f"❌ خطای بحرانی هنگام اتصال به دیتابیس: {e}", exc_info=True)
     collection = None
 
-# --- 4. مدل‌های Pydantic برای API ---
+# --- 4. مدل‌های Pydantic برای ورودی و خروجی API ---
 class VectorSearchRequest(BaseModel):
     embedding: List[float] = Field(..., description="وکتور امبدینگ از پیش محاسبه شده برای کوئری.")
     keywords: List[str] = Field(..., description="لیستی از کلمات کلیدی برای فیلتر اولیه.", example=["فرش", "مخمل"])
@@ -57,7 +57,7 @@ async def hybrid_search(request: VectorSearchRequest):
         raise HTTPException(status_code=400, detail="لیست کلمات کلیدی نمی‌تواند خالی باشد.")
 
     try:
-        # مرحله ۱: فیلتر کردن با کلیدواژه‌ها (بدون تغییر)
+        # مرحله ۱: فیلتر کردن با کلیدواژه‌ها به صورت دسته‌بندی شده
         all_ids_from_keyword_filter = set()
         normalized_keywords = [kw.lower() for kw in request.keywords]
         keyword_batches = [normalized_keywords[i:i + KEYWORD_BATCH_SIZE] for i in range(0, len(normalized_keywords), KEYWORD_BATCH_SIZE)]
@@ -69,33 +69,34 @@ async def hybrid_search(request: VectorSearchRequest):
                 if batch_results and batch_results.get('ids'):
                     all_ids_from_keyword_filter.update(batch_results['ids'])
             except Exception:
+                # در صورت بروز خطا در یک دسته، به کار ادامه می‌دهیم
                 pass
 
         if not all_ids_from_keyword_filter:
+            logger.warning("هیچ نتیجه‌ای پس از مرحله فیلتر با کلمات کلیدی یافت نشد.")
             return []
         
         unique_ids = list(all_ids_from_keyword_filter)
-        logger.info(f"{len(unique_ids)} نتیجه پس از فیلتر یافت شد. در حال واکشی اطلاعات...")
+        logger.info(f"{len(unique_ids)} نتیجه منحصر به فرد پس از فیلتر کلمات کلیدی یافت شد. در حال واکشی اطلاعات کامل...")
 
-        # مرحله ۲: گرفتن اطلاعات کامل محصولات فیلتر شده
+        # مرحله ۲: گرفتن اطلاعات کامل (شامل امبدینگ‌ها) برای محصولات فیلتر شده
         results_keyword = collection.get(ids=unique_ids, include=["documents", "embeddings"])
 
         if not results_keyword or not results_keyword.get('ids'):
+            logger.warning("پس از واکشی، هیچ محصولی با آی‌دی‌های مشخص شده یافت نشد.")
             return []
 
-        logger.info(f"اطلاعات کامل برای {len(results_keyword['ids'])} محصول دریافت شد. در حال رتبه‌بندی مجدد...")
+        logger.info(f"اطلاعات کامل برای {len(results_keyword['ids'])} محصول دریافت شد. در حال رتبه‌بندی مجدد در حافظه...")
 
-        # --- ✨✨✨ جایگزینی محاسبه شباهت با NumPy ✨✨✨ ---
-        
         # مرحله ۳: محاسبه شباهت و رتبه‌بندی مجدد با NumPy
         query_embedding = np.array(request.embedding, dtype=np.float32)
         filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
         
-        # محاسبه شباهت کسینوسی به صورت بهینه
-        # 1. نرمالایز کردن وکتورها
+        # محاسبه بهینه شباهت کسینوسی
+        # 1. نرمالایز کردن وکتورها (تقسیم بر طولشان)
         query_norm = query_embedding / np.linalg.norm(query_embedding)
         filtered_norms = filtered_embeddings / np.linalg.norm(filtered_embeddings, axis=1, keepdims=True)
-        # 2. محاسبه ضرب داخلی (که حالا معادل شباهت کسینوسی است)
+        # 2. محاسبه ضرب داخلی (Dot Product) که حالا معادل شباهت کسینوسی است
         similarities = np.dot(filtered_norms, query_norm)
 
         reranked_results = []
@@ -103,18 +104,24 @@ async def hybrid_search(request: VectorSearchRequest):
             reranked_results.append({
                 "id": results_keyword['ids'][i],
                 "name": doc_name,
-                "score": similarities[i] * 100
+                "score": similarities[i] * 100  # تبدیل شباهت به درصد
             })
         
-        # مرحله ۴: مرتب‌سازی و انتخاب بهترین‌ها
+        # مرحله ۴: مرتب‌سازی نهایی و انتخاب بهترین نتایج
         reranked_results.sort(key=lambda x: x['score'], reverse=True)
         top_results = reranked_results[:TOP_K_RESULTS]
         
-        logger.info(f"بازگرداندن {len(top_results)} نتیجه نهایی.")
+        logger.info(f"بازگرداندن {len(top_results)} نتیجه نهایی پس از رتبه‌بندی مجدد.")
         return top_results
     
     except Exception as e:
-        logger.error(f"خطای غیرمنتظره: {e}", exc_info=True)
+        logger.error(f"خطای غیرمنتظره در حین جستجوی هیبریدی: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="یک خطای داخلی در سرور رخ داد.")
 
-# ... (بقیه کد مثل قبل) ...
+@app.get("/", summary="Health Check")
+async def read_root():
+    return {
+        "status": "OK" if collection else "Error",
+        "message": "Headless hybrid search server is running." if collection else "Database not loaded.",
+        "version": API_VERSION
+    }

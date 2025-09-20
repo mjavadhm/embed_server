@@ -1,7 +1,6 @@
---extra-index-url https://pypi.org/simple
-
-chromadb
 fastapi
 uvicorn[standard]
-gdown
+pydantic
+sentence-transformers
 numpy
+chromadb

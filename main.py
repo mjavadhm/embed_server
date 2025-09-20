@@ -1,12 +1,15 @@
-import logging
 import os
-import chromadb
-import asyncio
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel, Field
-from typing import List, Optional
-from pathlib import Path
 import gdown
+import asyncio
+import logging
+import chromadb
+import numpy as np
+from typing import List
+from pathlib import Path
+from typing import List, Optional
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+
 
 # --- 1. پیکربندی و ثابت‌ها ---
 BASE_DATA_DIR = Path("/app/product_db")
@@ -229,26 +232,77 @@ async def vector_search(request: VectorSearchRequest):
         raise HTTPException(status_code=500, detail="An error occurred during the search process.")
 
 
-@app.post("/hybrid-search/", response_model=List[SearchResult], summary="Hybrid Search (Production)")
+@app.post("/hybrid-search/", response_model=List[SearchResult])
 async def hybrid_search(request: VectorSearchRequest):
-    """Endpoint اصلی جستجوی ترکیبی (ابتدا کلیدواژه، سپس وکتور)."""
-    if not app_initialized:
-        raise HTTPException(status_code=503, detail="Service is not initialized. Please call /startup first.")
-    if not request.keywords:
-        raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
-    try:
-        # ✨✨✨ اصلاح اصلی اینجاست: کلمات کلیدی را به حروف کوچک تبدیل کنید ✨✨✨
-        normalized_keywords = [kw.lower() for kw in request.keywords]
+    logger.info(f"درخواست جستجوی هیبریدی با {len(request.keywords)} کلمه کلیدی دریافت شد.")
 
-        loop = asyncio.get_running_loop()
-        # از لیست نرمال‌شده در تابع جستجو استفاده کنید
-        final_results = await loop.run_in_executor(None, search_sync_hybrid, request.embedding, normalized_keywords)
+    if collection is None:
+        raise HTTPException(status_code=503, detail="سرویس در دسترس نیست: دیتابیس بارگذاری نشده است.")
+
+    if not request.keywords:
+        raise HTTPException(status_code=400, detail="لیست کلمات کلیدی نمی‌تواند خالی باشد.")
+
+    try:
+        # مرحله ۱: فیلتر کردن با کلیدواژه‌ها (بدون تغییر)
+        all_ids_from_keyword_filter = set()
+        normalized_keywords = [kw.lower() for kw in request.keywords]
+        keyword_batches = [normalized_keywords[i:i + KEYWORD_BATCH_SIZE] for i in range(0, len(normalized_keywords), KEYWORD_BATCH_SIZE)]
         
-        logger.info(f"Returning {len(final_results)} hybrid search results.")
-        return final_results
+        for batch in keyword_batches:
+            where_filter = {"$or": [{"$contains": kw} for kw in batch]} if len(batch) > 1 else {"$contains": batch[0]}
+            try:
+                batch_results = collection.get(where_document=where_filter, include=[])
+                if batch_results and batch_results.get('ids'):
+                    all_ids_from_keyword_filter.update(batch_results['ids'])
+            except Exception:
+                pass
+
+        if not all_ids_from_keyword_filter:
+            return []
+        
+        unique_ids = list(all_ids_from_keyword_filter)
+        logger.info(f"{len(unique_ids)} نتیجه پس از فیلتر یافت شد. در حال واکشی اطلاعات...")
+
+        # مرحله ۲: گرفتن اطلاعات کامل محصولات فیلتر شده
+        results_keyword = collection.get(ids=unique_ids, include=["documents", "embeddings"])
+
+        if not results_keyword or not results_keyword.get('ids'):
+            return []
+
+        logger.info(f"اطلاعات کامل برای {len(results_keyword['ids'])} محصول دریافت شد. در حال رتبه‌بندی مجدد...")
+
+        # --- ✨✨✨ جایگزینی محاسبه شباهت با NumPy ✨✨✨ ---
+        
+        # مرحله ۳: محاسبه شباهت و رتبه‌بندی مجدد با NumPy
+        query_embedding = np.array(request.embedding, dtype=np.float32)
+        filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
+        
+        # محاسبه شباهت کسینوسی به صورت بهینه
+        # 1. نرمالایز کردن وکتورها
+        query_norm = query_embedding / np.linalg.norm(query_embedding)
+        filtered_norms = filtered_embeddings / np.linalg.norm(filtered_embeddings, axis=1, keepdims=True)
+        # 2. محاسبه ضرب داخلی (که حالا معادل شباهت کسینوسی است)
+        similarities = np.dot(filtered_norms, query_norm)
+
+        reranked_results = []
+        for i, doc_name in enumerate(results_keyword['documents']):
+            reranked_results.append({
+                "id": results_keyword['ids'][i],
+                "name": doc_name,
+                "score": similarities[i] * 100
+            })
+        
+        # مرحله ۴: مرتب‌سازی و انتخاب بهترین‌ها
+        reranked_results.sort(key=lambda x: x['score'], reverse=True)
+        top_results = reranked_results[:TOP_K_RESULTS]
+        
+        logger.info(f"بازگرداندن {len(top_results)} نتیجه نهایی.")
+        return top_results
+    
     except Exception as e:
-        logger.error(f"Error during hybrid search: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An error occurred during the search process.")
+        logger.error(f"خطای غیرمنتظره: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="یک خطای داخلی در سرور رخ داد.")
+
 
 
 @app.post("/get-embedding/", response_model=DebugResponse, summary="Debug: Get Embedding by Name")
@@ -280,4 +334,3 @@ async def read_root():
         "version": API_VERSION,
         "initialized": app_initialized
     }
-

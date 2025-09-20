@@ -3,34 +3,32 @@ import os
 import torch
 import numpy as np
 import chromadb
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import asyncio
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel, Field
 from typing import List
 from sentence_transformers import SentenceTransformer, util
 import gdown
 from pathlib import Path
 
-# --- 1. Configuration & Constants ---
-# مسیر پایه که به دیسک متصل است
-BASE_DATA_DIR = Path("/app/product_db") 
-
-# مسیرهای مدل و دیتابیس هر دو داخل مسیر پایه هستند
+# --- 1. پیکربندی و ثابت‌ها ---
+BASE_DATA_DIR = Path("/app/product_db")
 DB_PATH = str(BASE_DATA_DIR)
-MODEL_PATH = str(BASE_DATA_DIR / "embedding_model") # ✨ تغییر اصلی اینجاست ✨
+MODEL_PATH = str(BASE_DATA_DIR / "embedding_model")
 COLLECTION_NAME = "products"
-API_VERSION = "1.1.0"
+API_VERSION = "1.2.0-async"
 TOP_K_RESULTS = 15
 
-# --- 2. Logging Setup ---
+# --- 2. راه‌اندازی لاگ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- 3. Global Variables for Model & DB ---
+# --- 3. متغیرهای سراسری برای مدل و دیتابیس ---
 model: SentenceTransformer = None
 collection = None
 app_initialized = False
 
-# --- 4. Pydantic Models for API I/O ---
+# --- 4. مدل‌های Pydantic ---
 class HybridSearchRequest(BaseModel):
     query: str = Field(..., description="The full-text query for semantic search.", example="velvet kitchen rug")
     keywords: List[str] = Field(..., description="A list of keywords for initial filtering.", example=["rug", "velvet"])
@@ -42,91 +40,115 @@ class SearchResult(BaseModel):
 
 class DownloadRequest(BaseModel):
     drive_link: str = Field(..., description="لینک اشتراک‌گذاری فایل در گوگل درایو")
-    # مسیر مقصد اکنون اختیاری است و به صورت نسبی به مسیر پایه در نظر گرفته می‌شود
-    destination_path: str = Field("", description="مسیر نسبی برای ذخیره فایل روی دیسک (مثال: my_model/ یا my_database/)")
+    destination_path: str = Field("", description="مسیر نسبی برای ذخیره فایل روی دیسک (مثال: embedding_model)")
 
-# --- 5. FastAPI Application ---
+# --- 5. ساخت اپلیکیشن FastAPI ---
 app = FastAPI(
-    title="Unified Hybrid Search and Downloader API",
-    description="An API that first downloads files, then initializes a search model, and finally performs hybrid search.",
+    title="Async Unified Hybrid Search and Downloader API",
+    description="An asynchronous API that downloads files, initializes a search model, and performs hybrid search.",
     version=API_VERSION
 )
 
-# --- 6. Helper Functions ---
-def initialize_components():
-    """Loads the embedding model and connects to the ChromaDB database."""
+# --- 6. توابع همزمان (Sync) برای اجرا در Thread Pool ---
+def initialize_components_sync():
+    """
+    نسخه همزمان (sync) تابع راه‌اندازی که شامل کدهای blocking است.
+    این تابع در یک thread جداگانه اجرا خواهد شد.
+    """
     global model, collection, app_initialized
-    try:
-        if not os.path.exists(MODEL_PATH) or not os.path.exists(DB_PATH):
-            raise FileNotFoundError("Model or Database path does not exist. Please download files first.")
+    if not os.path.exists(MODEL_PATH) or not os.path.isdir(DB_PATH):
+        raise FileNotFoundError("Model or Database path does not exist. Please download files first.")
+    
+    logger.info("--- در حال راه‌اندازی کامپوننت‌های برنامه از مسیرهای محلی ---")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"در حال بارگذاری مدل از مسیر: {MODEL_PATH} روی دستگاه: '{device}'")
+    model = SentenceTransformer(MODEL_PATH, device=device)
+    logger.info("✅ مدل امبدینگ با موفقیت بارگذاری شد.")
 
-        logger.info("--- Initializing application components from local paths ---")
+    logger.info(f"در حال اتصال به دیتابیس ChromaDB در مسیر: {DB_PATH}")
+    db_client = chromadb.PersistentClient(path=DB_PATH)
+    collection = db_client.get_or_create_collection(name=COLLECTION_NAME)
+    logger.info(f"✅ اتصال به ChromaDB موفقیت‌آمیز بود. کالکشن '{COLLECTION_NAME}' شامل {collection.count()} آیتم است.")
+    
+    app_initialized = True
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Loading sentence transformer model from: {MODEL_PATH} onto device: '{device}'")
-        model = SentenceTransformer(MODEL_PATH, device=device)
-        logger.info("✅ Embedding model loaded successfully.")
+def search_sync(query: str, keywords: List[str]) -> List[SearchResult]:
+    """
+    نسخه همزمان (sync) تابع جستجو. تمام کدهای سنگین CPU-bound اینجا هستند.
+    این تابع در یک thread جداگانه اجرا خواهد شد.
+    """
+    # فیلتر بر اساس کلیدواژه
+    where_filter = {"$or": [{"$contains": kw} for kw in keywords]} if len(keywords) > 1 else {"$contains": keywords[0]}
+    results_keyword = collection.get(where_document=where_filter, include=["documents", "embeddings"])
+    
+    if not results_keyword or not results_keyword.get('ids'):
+        logger.info("پس از فیلتر کلیدواژه نتیجه‌ای یافت نشد.")
+        return []
 
-        logger.info(f"Connecting to ChromaDB at: {DB_PATH}")
-        db_client = chromadb.PersistentClient(path=DB_PATH)
-        collection = db_client.get_or_create_collection(name=COLLECTION_NAME)
-        logger.info(f"✅ Successfully connected to ChromaDB. Collection '{COLLECTION_NAME}' contains {collection.count()} items.")
-        
-        app_initialized = True
+    logger.info(f"تعداد {len(results_keyword['ids'])} نتیجه پس از فیلتر کلیدواژه یافت شد. در حال رتبه‌بندی مجدد...")
 
-    except Exception as e:
-        logger.critical(f"❌ Critical error during component initialization: {e}", exc_info=True)
-        model = None
-        collection = None
-        app_initialized = False
-        raise e
+    # رتبه‌بندی مجدد با جستجوی معنایی (بخش سنگین)
+    full_query_embedding = model.encode(query)
+    filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
+    similarities = util.cos_sim(full_query_embedding, filtered_embeddings)
+
+    reranked_results = [
+        {
+            "id": results_keyword['ids'][i],
+            "name": doc_name,
+            "score": similarities[0][i].item() * 100
+        }
+        for i, doc_name in enumerate(results_keyword['documents'])
+    ]
+    
+    reranked_results.sort(key=lambda x: x['score'], reverse=True)
+    return reranked_results[:TOP_K_RESULTS]
 
 def start_download(url: str, output_path: Path):
-    """Background task to download a file from Google Drive."""
-    logger.info(f"🚀 Starting download from {url} to {output_path}")
+    """تابع دانلود که در پس‌زمینه اجرا می‌شود (این بخش نیازی به async ندارد)."""
+    # ... (بدون تغییر)
+    logger.info(f"🚀 شروع دانلود از {url} به {output_path}")
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        # استفاده از gdown برای دانلود (تشخیص می‌دهد فایل است یا پوشه)
         gdown.download(url=url, output=str(output_path), quiet=False, fuzzy=True)
-        logger.info(f"✅ Download complete for: {output_path}")
+        logger.info(f"✅ دانلود برای {output_path} کامل شد.")
     except Exception as e:
-        logger.error(f"❌ Error downloading file {url}. Reason: {e}")
+        logger.error(f"❌ خطا در دانلود فایل {url}. دلیل: {e}")
 
-# --- 7. API Endpoints ---
+# --- 7. Endpoint های API (Asynchronous) ---
 @app.post("/startup/")
-def startup_server():
+async def startup_server():
     """
-    Initializes the embedding model and the database connection.
-    This must be called after files are downloaded and before searching.
+    Endpoint غیرهمزمان (async) برای راه‌اندازی مدل و دیتابیس.
     """
+    global app_initialized
     if app_initialized:
         return {"status": "warning", "message": "Application is already initialized."}
     
     try:
-        initialize_components()
-        return {"status": "success", "message": "Application components initialized successfully."}
+        # اجرای تابع blocking در یک thread جداگانه
+        await asyncio.get_running_loop().run_in_executor(None, initialize_components_sync)
+        return {"status": "success", "message": "کامپوننت‌های برنامه با موفقیت راه‌اندازی شدند."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize components: {str(e)}")
+        # ریست کردن وضعیت در صورت بروز خطا
+        app_initialized = False
+        logger.critical(f"❌ راه‌اندازی ناموفق بود: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"راه‌اندازی ناموفق بود: {str(e)}")
 
 @app.post("/get-files/")
-def schedule_download(request: DownloadRequest, background_tasks: BackgroundTasks):
-    """Schedules a file or folder download from Google Drive to the persistent disk."""
-    # مسیر کامل مقصد را با ترکیب مسیر پایه و مسیر درخواستی کاربر می‌سازیم
+async def schedule_download(request: DownloadRequest, background_tasks: BackgroundTasks):
+    """Endpoint برای زمان‌بندی دانلود (این بخش می‌تواند async باشد ولی ضروری نیست)."""
+    # ... (بدون تغییر)
     full_path = BASE_DATA_DIR.joinpath(request.destination_path).resolve()
-
-    # جلوگیری از حملات Path Traversal
     if BASE_DATA_DIR not in full_path.parents and full_path != BASE_DATA_DIR:
         raise HTTPException(
             status_code=400,
-            detail="Error: Invalid destination path. Must be inside the base data directory."
+            detail="خطا: مسیر مقصد نامعتبر است."
         )
-
-    # وظیفه دانلود را به پس‌زمینه اضافه می‌کنیم
     background_tasks.add_task(start_download, request.drive_link, full_path)
-
     return {
         "status": "success",
-        "message": "Download task has been scheduled.",
+        "message": "وظیفه دانلود با موفقیت زمان‌بندی شد.",
         "details": {
             "drive_link": request.drive_link,
             "save_location": str(full_path)
@@ -134,11 +156,38 @@ def schedule_download(request: DownloadRequest, background_tasks: BackgroundTask
     }
 
 @app.post("/hybrid-search/", response_model=List[SearchResult])
-def hybrid_search(request: HybridSearchRequest):
-    # (بدون تغییر نسبت به نسخه قبل)
-    ...
+async def hybrid_search(request: HybridSearchRequest):
+    """
+    ✨ Endpoint اصلی جستجو که به صورت غیرهمزمان (async) اجرا می‌شود. ✨
+    """
+    if not app_initialized or collection is None or model is None:
+        raise HTTPException(status_code=503, detail="سرویس در دسترس نیست. لطفاً ابتدا /startup را فراخوانی کنید.")
+
+    if not request.keywords:
+        raise HTTPException(status_code=400, detail="لیست کلیدواژه‌ها نمی‌تواند خالی باشد.")
+
+    try:
+        # اجرای تابع سنگین و همزمانِ جستجو در یک thread جداگانه
+        # این کار از مسدود شدن event loop جلوگیری می‌کند
+        loop = asyncio.get_running_loop()
+        final_results = await loop.run_in_executor(
+            None,  # استفاده از thread pool پیش‌فرض
+            search_sync,  # تابع همزمانی که باید اجرا شود
+            request.query,  # آرگومان‌های تابع
+            request.keywords
+        )
+        logger.info(f"بازگرداندن {len(final_results)} نتیجه نهایی.")
+        return final_results
+    except Exception as e:
+        logger.error(f"خطا در حین جستجو: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="خطایی در حین فرآیند جستجو رخ داد.")
 
 @app.get("/", summary="Health Check")
-def read_root():
-    # (بدون تغییر نسبت به نسخه قبل)
-    ...
+async def read_root():
+    """Endpoint ساده برای بررسی سلامت سرویس."""
+    return {
+        "status": "OK" if app_initialized else "Pending Initialization",
+        "message": "Server is running. Call /startup to initialize model and DB.",
+        "version": API_VERSION,
+        "initialized": app_initialized
+    }

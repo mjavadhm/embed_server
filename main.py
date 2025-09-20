@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from typing import List
 
 # --- 1. پیکربندی و ثابت‌ها ---
-DB_PATH = "product_db"
+DB_PATH = "/app/product_db"
 COLLECTION_NAME = "products"
 API_VERSION = "2.4.0-headless-stable-scoring"
 TOP_K_RESULTS = 15

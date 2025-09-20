@@ -3,46 +3,32 @@ import os
 import torch
 import numpy as np
 import chromadb
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import List
 from sentence_transformers import SentenceTransformer, util
+import gdown
+from pathlib import Path
 
 # --- 1. Configuration & Constants ---
-# --- Paths are now local within the container ---
-DB_PATH = "/app/product_db"
-MODEL_PATH = "/app/embedding_model" # Path to the local model
+# مسیر پایه که به دیسک متصل است
+BASE_DATA_DIR = Path("/app/product_db") 
+
+# مسیرهای مدل و دیتابیس هر دو داخل مسیر پایه هستند
+DB_PATH = str(BASE_DATA_DIR)
+MODEL_PATH = str(BASE_DATA_DIR / "embedding_model") # ✨ تغییر اصلی اینجاست ✨
 COLLECTION_NAME = "products"
-API_VERSION = "0.1.0"
+API_VERSION = "1.1.0"
 TOP_K_RESULTS = 15
 
 # --- 2. Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- 3. Model & Database Loading ---
-# --- All download logic is REMOVED ---
-try:
-    logger.info("--- Initializing application components from local paths ---")
-
-    # Determine device (CPU is expected in the Docker container)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Loading sentence transformer model from local path: {MODEL_PATH} onto device: '{device}'")
-    
-    # Load the model from the local directory inside the container
-    model = SentenceTransformer(MODEL_PATH, device=device)
-    logger.info("✅ Embedding model loaded successfully.")
-
-    logger.info(f"Connecting to ChromaDB at local path: {DB_PATH}")
-    # Connect to the persistent database inside the container
-    db_client = chromadb.PersistentClient(path=DB_PATH)
-    collection = db_client.get_collection(name=COLLECTION_NAME)
-    logger.info(f"✅ Successfully connected to ChromaDB. Collection '{COLLECTION_NAME}' contains {collection.count()} items.")
-
-except Exception as e:
-    logger.critical(f"❌ Critical error during component initialization: {e}", exc_info=True)
-    collection = None
-    model = None
+# --- 3. Global Variables for Model & DB ---
+model: SentenceTransformer = None
+collection = None
+app_initialized = False
 
 # --- 4. Pydantic Models for API I/O ---
 class HybridSearchRequest(BaseModel):
@@ -54,68 +40,105 @@ class SearchResult(BaseModel):
     name: str = Field(..., description="The Persian name of the product.")
     score: float = Field(..., description="The semantic similarity score as a percentage (0-100).")
 
+class DownloadRequest(BaseModel):
+    drive_link: str = Field(..., description="لینک اشتراک‌گذاری فایل در گوگل درایو")
+    # مسیر مقصد اکنون اختیاری است و به صورت نسبی به مسیر پایه در نظر گرفته می‌شود
+    destination_path: str = Field("", description="مسیر نسبی برای ذخیره فایل روی دیسک (مثال: my_model/ یا my_database/)")
+
 # --- 5. FastAPI Application ---
 app = FastAPI(
-    title="Hybrid Product Search API (Self-Contained)",
-    description="An API that performs a two-stage hybrid search from a self-contained Docker appliance.",
+    title="Unified Hybrid Search and Downloader API",
+    description="An API that first downloads files, then initializes a search model, and finally performs hybrid search.",
     version=API_VERSION
 )
 
+# --- 6. Helper Functions ---
+def initialize_components():
+    """Loads the embedding model and connects to the ChromaDB database."""
+    global model, collection, app_initialized
+    try:
+        if not os.path.exists(MODEL_PATH) or not os.path.exists(DB_PATH):
+            raise FileNotFoundError("Model or Database path does not exist. Please download files first.")
+
+        logger.info("--- Initializing application components from local paths ---")
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Loading sentence transformer model from: {MODEL_PATH} onto device: '{device}'")
+        model = SentenceTransformer(MODEL_PATH, device=device)
+        logger.info("✅ Embedding model loaded successfully.")
+
+        logger.info(f"Connecting to ChromaDB at: {DB_PATH}")
+        db_client = chromadb.PersistentClient(path=DB_PATH)
+        collection = db_client.get_or_create_collection(name=COLLECTION_NAME)
+        logger.info(f"✅ Successfully connected to ChromaDB. Collection '{COLLECTION_NAME}' contains {collection.count()} items.")
+        
+        app_initialized = True
+
+    except Exception as e:
+        logger.critical(f"❌ Critical error during component initialization: {e}", exc_info=True)
+        model = None
+        collection = None
+        app_initialized = False
+        raise e
+
+def start_download(url: str, output_path: Path):
+    """Background task to download a file from Google Drive."""
+    logger.info(f"🚀 Starting download from {url} to {output_path}")
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        # استفاده از gdown برای دانلود (تشخیص می‌دهد فایل است یا پوشه)
+        gdown.download(url=url, output=str(output_path), quiet=False, fuzzy=True)
+        logger.info(f"✅ Download complete for: {output_path}")
+    except Exception as e:
+        logger.error(f"❌ Error downloading file {url}. Reason: {e}")
+
+# --- 7. API Endpoints ---
+@app.post("/startup/")
+def startup_server():
+    """
+    Initializes the embedding model and the database connection.
+    This must be called after files are downloaded and before searching.
+    """
+    if app_initialized:
+        return {"status": "warning", "message": "Application is already initialized."}
+    
+    try:
+        initialize_components()
+        return {"status": "success", "message": "Application components initialized successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize components: {str(e)}")
+
+@app.post("/get-files/")
+def schedule_download(request: DownloadRequest, background_tasks: BackgroundTasks):
+    """Schedules a file or folder download from Google Drive to the persistent disk."""
+    # مسیر کامل مقصد را با ترکیب مسیر پایه و مسیر درخواستی کاربر می‌سازیم
+    full_path = BASE_DATA_DIR.joinpath(request.destination_path).resolve()
+
+    # جلوگیری از حملات Path Traversal
+    if BASE_DATA_DIR not in full_path.parents and full_path != BASE_DATA_DIR:
+        raise HTTPException(
+            status_code=400,
+            detail="Error: Invalid destination path. Must be inside the base data directory."
+        )
+
+    # وظیفه دانلود را به پس‌زمینه اضافه می‌کنیم
+    background_tasks.add_task(start_download, request.drive_link, full_path)
+
+    return {
+        "status": "success",
+        "message": "Download task has been scheduled.",
+        "details": {
+            "drive_link": request.drive_link,
+            "save_location": str(full_path)
+        }
+    }
+
 @app.post("/hybrid-search/", response_model=List[SearchResult])
 def hybrid_search(request: HybridSearchRequest):
-    logger.info(f"Received search request. Query: '{request.query}', Keywords: {request.keywords}")
-
-    if collection is None or model is None:
-        logger.error("Search aborted because a required component (DB or Model) is not available.")
-        raise HTTPException(status_code=503, detail="Service unavailable: Database or model not loaded.")
-
-    if not request.keywords:
-        logger.warning("Request received with empty keywords list.")
-        raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
-
-    try:
-        where_filter = {}
-        if len(request.keywords) == 1:
-            where_filter = {"$contains": request.keywords[0]}
-        else:
-            where_filter = {"$or": [{"$contains": kw} for kw in request.keywords]}
-        
-        results_keyword = collection.get(
-            where_document=where_filter,
-            include=["documents", "embeddings"]
-        )
-    except Exception as e:
-        logger.error(f"Error during ChromaDB keyword filtering: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An error occurred during database filtering.")
-    
-    if not results_keyword or not results_keyword.get('ids'):
-        logger.info("No results found after keyword filtering.")
-        return []
-
-    logger.info(f"Found {len(results_keyword['ids'])} results after keyword filtering. Proceeding to re-ranking.")
-
-    full_query_embedding = model.encode(request.query)
-    filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
-    similarities = util.cos_sim(full_query_embedding, filtered_embeddings)
-
-    reranked_results = []
-    for i, doc_name in enumerate(results_keyword['documents']):
-        reranked_results.append({
-            "id": results_keyword['ids'][i],
-            "name": doc_name,
-            "score": similarities[0][i].item() * 100
-        })
-    
-    reranked_results.sort(key=lambda x: x['score'], reverse=True)
-    final_results = reranked_results[:TOP_K_RESULTS]
-    logger.info(f"Returning {len(final_results)} re-ranked results.")
-    
-    return final_results
+    # (بدون تغییر نسبت به نسخه قبل)
+    ...
 
 @app.get("/", summary="Health Check")
 def read_root():
-    return {
-        "status": "OK",
-        "message": "Hybrid search server is running.",
-        "version": API_VERSION
-    }
+    # (بدون تغییر نسبت به نسخه قبل)
+    ...

@@ -9,9 +9,8 @@ from typing import List
 from sentence_transformers import SentenceTransformer, util
 
 # --- 1. Configuration & Constants ---
-# --- Paths are now local within the container ---
 DB_PATH = "/app/product_db"
-MODEL_PATH = "/app/product_db/model" # Path to the local model
+MODEL_PATH = "/app/product_db/model"
 COLLECTION_NAME = "products"
 API_VERSION = "0.1.0"
 TOP_K_RESULTS = 15
@@ -21,24 +20,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- 3. Model & Database Loading ---
-# --- All download logic is REMOVED ---
 try:
     logger.info("--- Initializing application components from local paths ---")
-
-    # Determine device (CPU is expected in the Docker container)
     device = "cpu"
     logger.info(f"Loading sentence transformer model from local path: {MODEL_PATH} onto device: '{device}'")
-    
-    # Load the model from the local directory inside the container
     model = SentenceTransformer(MODEL_PATH, device=device)
     logger.info("✅ Embedding model loaded successfully.")
-
     logger.info(f"Connecting to ChromaDB at local path: {DB_PATH}")
-    # Connect to the persistent database inside the container
     db_client = chromadb.PersistentClient(path=DB_PATH)
     collection = db_client.get_collection(name=COLLECTION_NAME)
     logger.info(f"✅ Successfully connected to ChromaDB. Collection '{COLLECTION_NAME}' contains {collection.count()} items.")
-
 except Exception as e:
     logger.critical(f"❌ Critical error during component initialization: {e}", exc_info=True)
     collection = None
@@ -55,7 +46,7 @@ class HybridSearchRequest(BaseModel):
 class SearchResult(BaseModel):
     id: str = Field(..., description="Unique identifier of the product.")
     name: str = Field(..., description="The Persian name of the product.")
-    score: float = Field(..., description="The semantic similarity score as a percentage (0-100).")
+    score: float = Field(..., description="The semantic similarity score for ranking.")
 
 # --- 5. FastAPI Application ---
 app = FastAPI(
@@ -64,68 +55,68 @@ app = FastAPI(
     version=API_VERSION
 )
 
+# =================================================================================
+# تابع بهینه‌شده برای جستجوی سریع
+# =================================================================================
 @app.post("/semantic-search/", response_model=List[SearchResult])
 def semantic_search(request: SemanticSearchRequest):
     """
-    Performs a pure semantic search based on the query text without keywords.
+    Performs an efficient pure semantic search using the database's native query capabilities.
     """
     logger.info(f"Received semantic search request. Query: '{request.query}'")
 
     if collection is None or model is None:
-        logger.error("Search aborted because a required component (DB or Model) is not available.")
         raise HTTPException(status_code=503, detail="Service unavailable: Database or model not loaded.")
 
     if not request.query.strip():
-        logger.warning("Request received with an empty or whitespace-only query.")
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
     try:
-        # 1. Get all items from the collection
-        all_items = collection.get(include=["documents", "embeddings"])
+        # 1. وکتور کوئری را ایجاد کن
+        query_embedding = model.encode(request.query).tolist()
 
-        if not all_items or not all_items.get('ids'):
-            logger.info("No items found in the collection to search.")
-            return []
+        # 2. از collection.query برای جستجوی بهینه و سریع استفاده کن
+        # این تابع از ایندکس‌های ChromaDB برای یافتن سریع نتایج استفاده می‌کند
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=TOP_K_RESULTS,
+            include=["documents", "distances"]
+        )
 
-        # 2. Encode the user's query
-        query_embedding = model.encode(request.query)
-        all_embeddings = np.array(all_items['embeddings'], dtype=np.float32)
+        # 3. نتایج را برای خروجی فرمت‌بندی کن
+        final_results = []
+        if results and results.get('ids'):
+            ids = results['ids'][0]
+            documents = results['documents'][0]
+            distances = results['distances'][0]
 
-        # 3. Calculate cosine similarity between the query and all items
-        similarities = util.cos_sim(query_embedding, all_embeddings)
+            for i in range(len(ids)):
+                # نکته: فاصله (distance) بستگی به متریک دیتابیس دارد (پیش‌فرض L2)
+                # برای تبدیل فاصله به امتیاز (که هرچه بیشتر بهتر باشد)، از یک فرمول ساده استفاده می‌کنیم
+                score = 100 / (1 + distances[i])
 
-        # 4. Prepare the results
-        reranked_results = []
-        for i, doc_name in enumerate(all_items['documents']):
-            reranked_results.append({
-                "id": all_items['ids'][i],
-                "name": doc_name,
-                "score": similarities[0][i].item() * 100
-            })
+                final_results.append({
+                    "id": ids[i],
+                    "name": documents[i],
+                    "score": score
+                })
         
-        # 5. Sort results by score
-        reranked_results.sort(key=lambda x: x['score'], reverse=True)
-        
-        # 6. Return top K results
-        final_results = reranked_results[:TOP_K_RESULTS]
-        logger.info(f"Returning {len(final_results)} re-ranked semantic search results.")
-        
+        logger.info(f"Returning {len(final_results)} semantic search results from DB query.")
         return final_results
 
     except Exception as e:
         logger.error(f"Error during semantic search: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred during semantic search.")
 
+# ... (بقیه کدها شامل hybrid_search و read_root بدون تغییر باقی می‌مانند) ...
 @app.post("/hybrid-search/", response_model=List[SearchResult])
 def hybrid_search(request: HybridSearchRequest):
     logger.info(f"Received search request. Query: '{request.query}', Keywords: {request.keywords}")
 
     if collection is None or model is None:
-        logger.error("Search aborted because a required component (DB or Model) is not available.")
         raise HTTPException(status_code=503, detail="Service unavailable: Database or model not loaded.")
 
     if not request.keywords:
-        logger.warning("Request received with empty keywords list.")
         raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
 
     try:
@@ -144,7 +135,6 @@ def hybrid_search(request: HybridSearchRequest):
         raise HTTPException(status_code=500, detail="An error occurred during database filtering.")
     
     if not results_keyword or not results_keyword.get('ids'):
-        logger.info("No results found after keyword filtering.")
         return []
 
     logger.info(f"Found {len(results_keyword['ids'])} results after keyword filtering. Proceeding to re-ranking.")

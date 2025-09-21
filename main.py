@@ -45,6 +45,9 @@ except Exception as e:
     model = None
 
 # --- 4. Pydantic Models for API I/O ---
+class SemanticSearchRequest(BaseModel):
+    query: str = Field(..., description="The text query for semantic search.", example="فرش آشپزخانه مخملی")
+
 class HybridSearchRequest(BaseModel):
     query: str = Field(..., description="The full-text query for semantic search.", example="velvet kitchen rug")
     keywords: List[str] = Field(..., description="A list of keywords for initial filtering.", example=["rug", "velvet"])
@@ -56,10 +59,62 @@ class SearchResult(BaseModel):
 
 # --- 5. FastAPI Application ---
 app = FastAPI(
-    title="Hybrid Product Search API (Self-Contained)",
-    description="An API that performs a two-stage hybrid search from a self-contained Docker appliance.",
+    title="Hybrid and Semantic Product Search API (Self-Contained)",
+    description="An API that performs a two-stage hybrid search and a pure semantic search from a self-contained Docker appliance.",
     version=API_VERSION
 )
+
+@app.post("/semantic-search/", response_model=List[SearchResult])
+def semantic_search(request: SemanticSearchRequest):
+    """
+    Performs a pure semantic search based on the query text without keywords.
+    """
+    logger.info(f"Received semantic search request. Query: '{request.query}'")
+
+    if collection is None or model is None:
+        logger.error("Search aborted because a required component (DB or Model) is not available.")
+        raise HTTPException(status_code=503, detail="Service unavailable: Database or model not loaded.")
+
+    if not request.query.strip():
+        logger.warning("Request received with an empty or whitespace-only query.")
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+
+    try:
+        # 1. Get all items from the collection
+        all_items = collection.get(include=["documents", "embeddings"])
+
+        if not all_items or not all_items.get('ids'):
+            logger.info("No items found in the collection to search.")
+            return []
+
+        # 2. Encode the user's query
+        query_embedding = model.encode(request.query)
+        all_embeddings = np.array(all_items['embeddings'], dtype=np.float32)
+
+        # 3. Calculate cosine similarity between the query and all items
+        similarities = util.cos_sim(query_embedding, all_embeddings)
+
+        # 4. Prepare the results
+        reranked_results = []
+        for i, doc_name in enumerate(all_items['documents']):
+            reranked_results.append({
+                "id": all_items['ids'][i],
+                "name": doc_name,
+                "score": similarities[0][i].item() * 100
+            })
+        
+        # 5. Sort results by score
+        reranked_results.sort(key=lambda x: x['score'], reverse=True)
+        
+        # 6. Return top K results
+        final_results = reranked_results[:TOP_K_RESULTS]
+        logger.info(f"Returning {len(final_results)} re-ranked semantic search results.")
+        
+        return final_results
+
+    except Exception as e:
+        logger.error(f"Error during semantic search: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An error occurred during semantic search.")
 
 @app.post("/hybrid-search/", response_model=List[SearchResult])
 def hybrid_search(request: HybridSearchRequest):

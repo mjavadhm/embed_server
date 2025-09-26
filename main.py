@@ -12,10 +12,16 @@ from sentence_transformers import SentenceTransformer, util
 
 # --- 1. Configuration & Constants ---
 DB_PATH = "/app/product_db"
-MODEL_PATH = "/app/product_db/model"
-PRODUCT_COLLECTION_NAME = "products" # Renamed for clarity
-CATEGORY_COLLECTION_NAME = "categories" # New constant for categories
-API_VERSION = "0.1.1" # Incremented version
+# --- مدل‌ها ---
+# مدل اصلی و سریع‌تر برای محصولات
+PRODUCT_MODEL_NAME = "distiluse-base-multilingual-cased-v1" 
+# مدل دقیق‌تر و قوی‌تر فارسی برای دسته‌بندی‌ها
+CATEGORY_MODEL_NAME = "HooshvareLab/bert-fa-base-uncased" 
+MODEL_PATH = "/app/product_db/model" # مسیر برای مدل محصولات
+
+PRODUCT_COLLECTION_NAME = "products"
+CATEGORY_COLLECTION_NAME = "categories"
+API_VERSION = "0.2.0" # افزایش نسخه به دلیل تغییرات اساسی
 TOP_K_RESULTS = 15
 
 # --- 2. Logging Setup ---
@@ -24,30 +30,48 @@ logger = logging.getLogger(__name__)
 
 # --- 3. Model & Database Loading ---
 try:
-    logger.info("--- Initializing application components from local paths ---")
+    logger.info("--- Initializing application components ---")
     device = "cpu"
-    logger.info(f"Loading sentence transformer model from local path: {MODEL_PATH} onto device: '{device}'")
-    model = SentenceTransformer(MODEL_PATH, device=device)
-    logger.info("✅ Embedding model loaded successfully.")
+    
+    # --- بارگذاری دو مدل مجزا ---
+    logger.info(f"Loading PRODUCT model: '{PRODUCT_MODEL_NAME}' onto device: '{device}'")
+    product_model = SentenceTransformer(MODEL_PATH, device=device)
+    logger.info("✅ Product embedding model loaded successfully.")
 
+    logger.info(f"Loading CATEGORY model: '{CATEGORY_MODEL_NAME}' onto device: '{device}'")
+    category_model = SentenceTransformer(CATEGORY_MODEL_NAME, device=device)
+    logger.info("✅ Category embedding model loaded successfully.")
+
+    # --- اتصال به دیتابیس ---
     logger.info(f"Connecting to ChromaDB at local path: {DB_PATH}")
     db_client = chromadb.PersistentClient(path=DB_PATH)
 
-    # Load or create product collection
+    # --- مدیریت کالکشن‌ها ---
+    
+    # ۱. کالکشن محصولات: فقط بارگذاری یا ایجاد می‌شود (پاک نمی‌شود)
     product_collection = db_client.get_or_create_collection(name=PRODUCT_COLLECTION_NAME)
     logger.info(f"✅ Successfully connected to ChromaDB. Collection '{PRODUCT_COLLECTION_NAME}' contains {product_collection.count()} items.")
 
-    # Load or create category collection
+    # ۲. کالکشن دسته‌بندی: ابتدا حذف و سپس از نو ایجاد می‌شود (برای شروع تازه)
+    try:
+        logger.warning(f"Attempting to delete collection '{CATEGORY_COLLECTION_NAME}' to ensure a fresh start.")
+        db_client.delete_collection(name=CATEGORY_COLLECTION_NAME)
+        logger.info(f"✅ Collection '{CATEGORY_COLLECTION_NAME}' deleted successfully.")
+    except Exception as e:
+        logger.warning(f"Could not delete collection '{CATEGORY_COLLECTION_NAME}' (it might not exist, which is okay): {e}")
+        
     category_collection = db_client.get_or_create_collection(name=CATEGORY_COLLECTION_NAME)
-    logger.info(f"✅ Successfully connected to ChromaDB. Collection '{CATEGORY_COLLECTION_NAME}' contains {category_collection.count()} items.")
+    logger.info(f"✅ Collection '{CATEGORY_COLLECTION_NAME}' created fresh. It currently contains {category_collection.count()} items.")
 
 except Exception as e:
     logger.critical(f"❌ Critical error during component initialization: {e}", exc_info=True)
     product_collection = None
     category_collection = None
-    model = None
+    product_model = None
+    category_model = None
 
-# --- 4. Pydantic Models for API I/O ---
+
+# --- 4. Pydantic Models for API I/O (بدون تغییر) ---
 
 # Models for Product Search
 class SemanticSearchRequest(BaseModel):
@@ -86,32 +110,29 @@ app = FastAPI(
 )
 
 # =================================================================================
-# اندپوینت‌های جدید برای مدیریت و جستجوی دسته‌بندی‌ها (Categories)
+# اندپوینت‌های مدیریت و جستجوی دسته‌بندی‌ها (با استفاده از مدل جدید)
 # =================================================================================
 
 @app.post("/add-category/", summary="Add or Update a Category", status_code=201)
 def add_category(request: CategoryAddRequest):
     """
     Adds a new category or updates an existing one based on the ID.
-    The category's 'title' is embedded and stored for semantic search.
+    The category's 'title' is embedded using the powerful Persian model.
     """
     logger.info(f"Received request to add/update category. Title: '{request.title}'")
 
-    if category_collection is None or model is None:
-        raise HTTPException(status_code=503, detail="Service unavailable: Database or model not loaded.")
+    if category_collection is None or category_model is None:
+        raise HTTPException(status_code=503, detail="Service unavailable: Category database or model not loaded.")
 
     if not request.title.strip():
         raise HTTPException(status_code=400, detail="Category title cannot be empty.")
 
     try:
-        # 1. شناسه را مدیریت کن: اگر ارائه نشده بود، یک UUID جدید بساز
         category_id = request.id if request.id else str(uuid4())
+        
+        # استفاده از مدل مخصوص دسته‌بندی برای امبد کردن
+        title_embedding = category_model.encode(request.title).tolist()
 
-        # 2. عنوان را امبد کن
-        title_embedding = model.encode(request.title).tolist()
-
-        # 3. داده‌ها را در کالکشن دسته‌بندی‌ها اضافه یا به‌روزرسانی کن (upsert)
-        # نکته: متادیتا فقط از انواع داده پایه پشتیبانی می‌کند، بنابراین دیکشنری به رشته JSON تبدیل می‌شود
         category_collection.upsert(
             ids=[category_id],
             embeddings=[title_embedding],
@@ -133,28 +154,26 @@ def add_category(request: CategoryAddRequest):
 @app.post("/search-category/", response_model=List[CategorySearchResult], summary="Search for Categories")
 def search_category(request: CategorySearchRequest):
     """
-    Performs a semantic search to find the most relevant categories based on a query.
+    Performs a semantic search to find the most relevant categories using the Persian model.
     """
     logger.info(f"Received category search request. Query: '{request.query}'")
 
-    if category_collection is None or model is None:
-        raise HTTPException(status_code=503, detail="Service unavailable: Database or model not loaded.")
+    if category_collection is None or category_model is None:
+        raise HTTPException(status_code=503, detail="Service unavailable: Category database or model not loaded.")
 
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
     try:
-        # 1. کوئری را امبد کن
-        query_embedding = model.encode(request.query).tolist()
+        # استفاده از مدل مخصوص دسته‌بندی برای امبد کردن کوئری
+        query_embedding = category_model.encode(request.query).tolist()
 
-        # 2. با استفاده از کوئری امبد شده، در کالکشن دسته‌بندی‌ها جستجو کن
         results = category_collection.query(
             query_embeddings=[query_embedding],
             n_results=TOP_K_RESULTS,
             include=["metadatas", "distances"]
         )
 
-        # 3. نتایج را فرمت‌بندی کن
         final_results = []
         if results and results.get('ids'):
             ids = results['ids'][0]
@@ -164,7 +183,6 @@ def search_category(request: CategorySearchRequest):
             for i in range(len(ids)):
                 score = 100 / (1 + distances[i])
                 
-                # رشته JSON ذخیره شده در متادیتا را به دیکشنری تبدیل کن
                 try:
                     feature_schema_dict = json.loads(metadatas[i].get("feature_schema", "{}"))
                 except (json.JSONDecodeError, TypeError):
@@ -186,24 +204,25 @@ def search_category(request: CategorySearchRequest):
 
 
 # =================================================================================
-# اندپوینت‌های موجود برای جستجوی محصولات (با تغییر نام متغیر کالکشن)
+# اندپوینت‌های جستجوی محصولات (با استفاده از مدل اصلی)
 # =================================================================================
 
 @app.post("/semantic-search/", response_model=List[SearchResult])
 def semantic_search(request: SemanticSearchRequest):
     """
-    Performs an efficient pure semantic search using the database's native query capabilities.
+    Performs an efficient pure semantic search using the product model.
     """
     logger.info(f"Received semantic search request. Query: '{request.query}'")
 
-    if product_collection is None or model is None:
-        raise HTTPException(status_code=503, detail="Service unavailable: Database or model not loaded.")
+    if product_collection is None or product_model is None:
+        raise HTTPException(status_code=503, detail="Service unavailable: Product database or model not loaded.")
 
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
     try:
-        query_embedding = model.encode(request.query).tolist()
+        # استفاده از مدل محصولات برای امبد کردن
+        query_embedding = product_model.encode(request.query).tolist()
         results = product_collection.query(
             query_embeddings=[query_embedding],
             n_results=TOP_K_RESULTS,
@@ -231,8 +250,8 @@ def semantic_search(request: SemanticSearchRequest):
 @app.post("/hybrid-search/", response_model=List[SearchResult])
 def hybrid_search(request: HybridSearchRequest):
     logger.info(f"Received search request. Query: '{request.query}', Keywords: {request.keywords}")
-    if product_collection is None or model is None:
-        raise HTTPException(status_code=503, detail="Service unavailable: Database or model not loaded.")
+    if product_collection is None or product_model is None:
+        raise HTTPException(status_code=503, detail="Service unavailable: Product database or model not loaded.")
     if not request.keywords:
         raise HTTPException(status_code=400, detail="Keywords list cannot be empty.")
     try:
@@ -244,7 +263,8 @@ def hybrid_search(request: HybridSearchRequest):
     if not results_keyword or not results_keyword.get('ids'):
         return []
     logger.info(f"Found {len(results_keyword['ids'])} results after keyword filtering. Proceeding to re-ranking.")
-    full_query_embedding = model.encode(request.query)
+    # استفاده از مدل محصولات برای امبد کردن
+    full_query_embedding = product_model.encode(request.query)
     filtered_embeddings = np.array(results_keyword['embeddings'], dtype=np.float32)
     similarities = util.cos_sim(full_query_embedding, filtered_embeddings)
     reranked_results = [{"id": results_keyword['ids'][i], "name": doc_name, "score": similarities[0][i].item() * 100} for i, doc_name in enumerate(results_keyword['documents'])]
